@@ -1,0 +1,41 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cms-pricing-mcp-server",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "alias": {
+    "ai": "./src/ai-stub.ts"
+  },
+  "migrations": [
+    {
+      "new_sqlite_classes": ["CmsPricingDataDO"],
+      "tag": "v1"
+    },
+    {
+      "new_sqlite_classes": ["MyMCP"],
+      "tag": "v2"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "CmsPricingDataDO",
+        "name": "CMS_PRICING_DATA_DO"
+      },
+      {
+        "class_name": "MyMCP",
+        "name": "MCP_OBJECT"
+      }
+    ]
+  },
+  "worker_loaders": [
+    { "binding": "CODE_MODE_LOADER" }
+  ],
+  "observability": {
+    "enabled": true
+  },
+  "dev": {
+    "port": 8866
+  }
+}
