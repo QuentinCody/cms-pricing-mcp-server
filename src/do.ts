@@ -24,6 +24,14 @@ export class CmsPricingDataDO extends RestStagingDO {
             };
         }
 
+        // HCPCS/RBCS code reference (check before other HCPCS branches — RBCS has RBCS_Id)
+        if ("HCPCS_Cd" in sample && "RBCS_Id" in sample) {
+            return {
+                tableName: "hcpcs_rbcs",
+                indexes: ["HCPCS_Cd", "RBCS_Cat", "RBCS_Cat_Subcat", "RBCS_Major_Ind"],
+            };
+        }
+
         // Physician data with HCPCS + NPI
         if ("HCPCS_Cd" in sample && "Rndrng_NPI" in sample) {
             return {

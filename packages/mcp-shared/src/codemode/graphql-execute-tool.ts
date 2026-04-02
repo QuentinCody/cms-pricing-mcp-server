@@ -105,7 +105,7 @@ function buildDescription(
 	return (
 		`Execute JavaScript code against the ${name} GraphQL API. ` +
 		`Code runs in a sandboxed V8 isolate with:\n` +
-		`- gql.query(queryString, variables?) — execute GraphQL queries\n` +
+		`- gql.query(queryString, variables?) — execute GraphQL queries (returns data directly, e.g. result.gene not result.data.gene)\n` +
 		`- schema.types(), schema.type(name), schema.search(query) — explore the schema\n` +
 		`- schema.queryRoot() — list available query entry points with args\n` +
 		`- schema.enumValues(name), schema.inputType(name) — inspect enums and input types\n` +

@@ -48,14 +48,16 @@ describe("createGraphqlProxyTool", () => {
 		expect(result.errors).toHaveLength(1);
 	});
 
-	it("returns data+errors for partial results", async () => {
+	it("returns data directly with __errors for partial results", async () => {
 		const tool = makeTool(async () => ({
 			data: { gene: { id: 1 } },
 			errors: [{ message: "Deprecated field" }],
 		}));
 		const result = (await tool.handler({ query: "{ gene { id } }" }, stubCtx)) as Record<string, unknown>;
-		expect(result.data).toEqual({ gene: { id: 1 } });
-		expect(result.errors).toHaveLength(1);
+		// Data is returned directly (unwrapped), not inside a .data wrapper
+		expect(result.gene).toEqual({ id: 1 });
+		// Partial errors are attached as __errors
+		expect(result.__errors).toHaveLength(1);
 	});
 
 	it("returns __gql_error when fetch throws", async () => {

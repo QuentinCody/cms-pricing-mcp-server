@@ -159,6 +159,83 @@ function safeJsonParse(value: string): unknown {
 export class RestStagingDO extends DurableObject {
 	protected chunking = new ChunkingEngine();
 
+	constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
+		super(ctx, env);
+		ctx.blockConcurrencyWhile(async () => {
+			this.migrateMetadata();
+		});
+	}
+
+	/**
+	 * Versioned migration for internal metadata tables.
+	 * All metadata tables are created here so they exist before any handler runs.
+	 * Future schema changes (ALTER TABLE, new indexes) go as new version blocks.
+	 */
+	private migrateMetadata(): void {
+		this.ctx.storage.sql.exec(
+			`CREATE TABLE IF NOT EXISTS _do_migrations (
+				id INTEGER PRIMARY KEY,
+				applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+			)`,
+		);
+
+		const row = this.ctx.storage.sql
+			.exec("SELECT COALESCE(MAX(id), 0) as v FROM _do_migrations")
+			.one() as { v: number };
+		const version = row.v;
+
+		if (version < 1) {
+			this.ctx.storage.sql.exec(
+				`CREATE TABLE IF NOT EXISTS _staging_metadata (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					tool_name TEXT,
+					server_name TEXT,
+					args_json TEXT,
+					api_url TEXT,
+					staged_at TEXT DEFAULT CURRENT_TIMESTAMP,
+					input_rows INTEGER,
+					stored_rows INTEGER,
+					failed_rows INTEGER,
+					warnings_json TEXT
+				)`,
+			);
+			this.ctx.storage.sql.exec(
+				`CREATE TABLE IF NOT EXISTS _inferred_schema (
+					id INTEGER PRIMARY KEY,
+					schema_json TEXT
+				)`,
+			);
+			this.ctx.storage.sql.exec(
+				`CREATE TABLE IF NOT EXISTS _column_profiles (
+					id INTEGER PRIMARY KEY,
+					profiles_json TEXT
+				)`,
+			);
+			this.ctx.storage.sql.exec(
+				`CREATE TABLE IF NOT EXISTS _session_registry (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					session_id TEXT NOT NULL,
+					data_access_id TEXT NOT NULL,
+					tool_name TEXT,
+					tables_json TEXT,
+					total_rows INTEGER,
+					tool_prefix TEXT,
+					created_at TEXT DEFAULT CURRENT_TIMESTAMP
+				)`,
+			);
+			this.ctx.storage.sql.exec(
+				`CREATE INDEX IF NOT EXISTS idx_session_registry_session_time
+					ON _session_registry(session_id, created_at)`,
+			);
+			this.ctx.storage.sql.exec(
+				`INSERT INTO _do_migrations (id) VALUES (1)`,
+			);
+		}
+
+		// Future migrations go here:
+		// if (version < 2) { ... INSERT INTO _do_migrations (id) VALUES (2); }
+	}
+
 	/** Override in subclass to provide domain-specific schema hints (Tier 1) */
 	protected getSchemaHints(_data: unknown): SchemaHints | undefined {
 		return undefined;
@@ -240,21 +317,6 @@ export class RestStagingDO extends DurableObject {
 		args?: Record<string, unknown>;
 		apiUrl?: string;
 	}): void {
-		this.ctx.storage.sql.exec(
-			`CREATE TABLE IF NOT EXISTS _staging_metadata (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				tool_name TEXT,
-				server_name TEXT,
-				args_json TEXT,
-				api_url TEXT,
-				staged_at TEXT DEFAULT CURRENT_TIMESTAMP,
-				input_rows INTEGER,
-				stored_rows INTEGER,
-				failed_rows INTEGER,
-				warnings_json TEXT
-			)`,
-		);
-
 		if (context) {
 			this.ctx.storage.sql.exec(
 				`INSERT INTO _staging_metadata (tool_name, server_name, args_json, api_url) VALUES (?, ?, ?, ?)`,
@@ -295,12 +357,6 @@ export class RestStagingDO extends DurableObject {
 	private persistInferredSchema(schema: InferredSchema): void {
 		try {
 			this.ctx.storage.sql.exec(
-				`CREATE TABLE IF NOT EXISTS _inferred_schema (
-					id INTEGER PRIMARY KEY,
-					schema_json TEXT
-				)`,
-			);
-			this.ctx.storage.sql.exec(
 				`INSERT OR REPLACE INTO _inferred_schema (id, schema_json) VALUES (1, ?)`,
 				JSON.stringify(schema),
 			);
@@ -316,12 +372,6 @@ export class RestStagingDO extends DurableObject {
 	private persistColumnProfiles(schema: InferredSchema): void {
 		try {
 			const profiles = computeColumnProfiles(schema, this.ctx.storage.sql);
-			this.ctx.storage.sql.exec(
-				`CREATE TABLE IF NOT EXISTS _column_profiles (
-					id INTEGER PRIMARY KEY,
-					profiles_json TEXT
-				)`,
-			);
 			this.ctx.storage.sql.exec(
 				`INSERT OR REPLACE INTO _column_profiles (id, profiles_json) VALUES (1, ?)`,
 				JSON.stringify(profiles),
@@ -758,19 +808,6 @@ export class RestStagingDO extends DurableObject {
 				400,
 			);
 		}
-
-		this.ctx.storage.sql.exec(
-			`CREATE TABLE IF NOT EXISTS _session_registry (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				session_id TEXT NOT NULL,
-				data_access_id TEXT NOT NULL,
-				tool_name TEXT,
-				tables_json TEXT,
-				total_rows INTEGER,
-				tool_prefix TEXT,
-				created_at TEXT DEFAULT CURRENT_TIMESTAMP
-			)`,
-		);
 
 		// TTL cleanup: remove entries older than 24h
 		this.ctx.storage.sql.exec(

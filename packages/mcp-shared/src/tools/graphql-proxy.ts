@@ -141,14 +141,22 @@ async function executeAndMaybeStage(
 		return { __gql_error: true, message: messages, errors: response.errors };
 	}
 
-	// Determine what to return (data, or data+errors for partial results)
-	const resultData = response.errors
-		? { data: response.data, errors: response.errors }
-		: response.data;
+	// Always return response.data directly for consistent shape.
+	// If there are partial errors alongside data, attach them as a
+	// non-enumerable __errors property so they don't pollute staging
+	// but isolate code can still inspect them via result.__errors.
+	const resultData = response.data ?? {};
 
 	const responseBytes = JSON.stringify(resultData).length;
 	const staged = await tryAutoStage(resultData, responseBytes, staging);
-	return staged ?? resultData;
+	const output = staged ?? resultData;
+
+	// Attach partial errors if present (errors-only case is handled above)
+	if (response.errors && output && typeof output === "object") {
+		(output as Record<string, unknown>).__errors = response.errors;
+	}
+
+	return output;
 }
 
 /**

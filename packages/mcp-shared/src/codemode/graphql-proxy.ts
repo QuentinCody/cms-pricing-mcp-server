@@ -83,14 +83,14 @@ var gql = {
   /**
    * Execute a GraphQL query. Variables are optional.
    *   const result = await gql.query('{ gene(entrezSymbol: "EGFR") { id name } }');
-   *   const result = await gql.query(query, { symbol: "EGFR" });
+   *   // result.gene.id, result.gene.name — data is at the top level
    *
-   * Returns the full GraphQL response (with .data and optional .errors).
+   * Returns the GraphQL data object directly (unwrapped from the data envelope).
    * If the response is large (>30KB), it is auto-staged into SQLite.
    * In that case the return value has __staged=true and data_access_id.
    *
-   * GraphQL errors WITH partial data are returned (not thrown) so you can
-   * inspect both result.data and result.errors. Errors WITHOUT data throw.
+   * If the API returned partial errors alongside data, they are available
+   * on result.__errors (array). Errors WITHOUT any data throw an exception.
    */
   query: async function(query, variables) {
     var result = await codemode.__graphql_proxy({

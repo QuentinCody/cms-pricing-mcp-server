@@ -28,6 +28,8 @@ export const DATASET_MAP: Record<string, string> = {
     "drug-spending/part-d": "7e0b4365-fd63-4a29-8f5e-e0ac9f66a81b",
     // Geographic Variation
     "geographic-variation": "6219697b-8f6c-4164-bed4-cd9317c58ebc",
+    // HCPCS Code Reference (RBCS — Restructured BETOS Classification System)
+    "hcpcs/codes": "e3db6e56-149f-49ce-b374-40aecda2357b",
 };
 
 export const cmsPricingCatalog: ApiCatalog = {
@@ -35,7 +37,7 @@ export const cmsPricingCatalog: ApiCatalog = {
     baseUrl: "https://data.cms.gov",
     version: "2024",
     auth: "none",
-    endpointCount: 31,
+    endpointCount: 33,
     notes:
         "- All data from Data.CMS.gov Data API — free, no auth required\n" +
         "- API pattern: GET /data-api/v1/dataset/{uuid}/data with query params\n" +
@@ -46,8 +48,15 @@ export const cmsPricingCatalog: ApiCatalog = {
         "- Sorting: sort=ColumnName (prefix with - for descending)\n" +
         "- Column selection: column=Col1,Col2,Col3\n" +
         "- Append /stats to any data endpoint to get {found_rows, total_rows}\n" +
-        "- Code systems: MS-DRG (inpatient), APC (outpatient), HCPCS (physician/DMEPOS/lab)\n" +
+        "- Code systems: MS-DRG (inpatient), APC (outpatient), HCPCS (physician/DMEPOS/lab). Use /hcpcs/codes to look up or classify any HCPCS/CPT code via the RBCS taxonomy.\n" +
         "- All payment amounts are in USD\n" +
+        "- BUILT-IN FEE SCHEDULES: Pre-loaded SQLite tables are available via cms_pricing_query_data with data_access_id='__fee_schedules':\n" +
+        "  - pfs_indicators: Physician Fee Schedule (31K rows) — hcpc, modifier, sdesc, rvu_work, rvu_mp, conv_fact, full_nfac_total, full_fac_total\n" +
+        "  - pfs_localities: Geographic Practice Cost Indices (110 rows) — locality, loc_description, mac, mac_description, gpci_work, gpci_pe, gpci_mp\n" +
+        "  - PFS has TWO rows per code (two conversion factors: transitional vs fully-implemented). Filter with conv_fact or use MAX/MIN.\n" +
+        "  - JOIN pfs_indicators with pfs_localities to calculate geographically-adjusted payment: (rvu_work*gpci_work + pe_rvu*gpci_pe + rvu_mp*gpci_mp) * conv_fact\n" +
+        "  - Use cms_pricing_get_schema with data_access_id='__fee_schedules' to see all columns and row counts\n" +
+        "- /procedure-summary has CODES ONLY (no descriptions) — use pfs_indicators.sdesc or /physician datasets to look up code descriptions first\n" +
         "- Data updated annually (most datasets refresh Apr-Oct)",
     endpoints: [
         // --- Inpatient (MS-DRG) ---
@@ -341,6 +350,37 @@ export const cmsPricingCatalog: ApiCatalog = {
             path: "/geographic-variation/stats",
             summary: "Row count stats for geographic variation dataset",
             category: "geographic",
+        },
+
+        // --- HCPCS Code Reference (RBCS Classification) ---
+        {
+            method: "GET",
+            path: "/hcpcs/codes",
+            summary:
+                "HCPCS code reference via the Restructured BETOS Classification System (RBCS). 18.9K rows. " +
+                "Maps every HCPCS/CPT code to clinical categories and subcategories. " +
+                "Fields: HCPCS_Cd, RBCS_Cat, RBCS_Cat_Desc (e.g. Evaluation & Management, Procedures, Imaging), " +
+                "RBCS_Cat_Subcat, RBCS_Subcat_Desc, RBCS_FamNumb, RBCS_Family_Desc, RBCS_Major_Ind (Y/N), " +
+                "HCPCS_Cd_Add_Dt, HCPCS_Cd_End_Dt. Use to classify or look up any HCPCS/CPT code.",
+            category: "hcpcs",
+            queryParams: [
+                { name: "filter[HCPCS_Cd]", type: "string", required: false, description: "Filter by exact HCPCS/CPT code (e.g. '99213', 'J9035', 'A4253')" },
+                { name: "filter[RBCS_Cat]", type: "string", required: false, description: "Filter by RBCS category letter (A=Anesthesia, E=Evaluation & Management, P=Procedures, I=Imaging, T=Tests, D=DME, O=Other, M=Exceptions/Unclassified)" },
+                { name: "filter[RBCS_Cat_Desc]", type: "string", required: false, description: "Filter by category description (e.g. 'Procedures', 'Imaging')" },
+                { name: "filter[RBCS_Cat_Subcat]", type: "string", required: false, description: "Filter by subcategory code (e.g. 'PM' for Major Procedures)" },
+                { name: "filter[RBCS_Major_Ind]", type: "string", required: false, description: "Filter by major procedure indicator: Y or N" },
+                { name: "keyword", type: "string", required: false, description: "Full-text keyword search across all fields" },
+                { name: "size", type: "number", required: false, description: "Max results per page (max 5000, default 1000)" },
+                { name: "offset", type: "number", required: false, description: "Pagination offset" },
+                { name: "sort", type: "string", required: false, description: "Sort column (prefix - for desc)" },
+                { name: "column", type: "string", required: false, description: "Comma-separated column names to include" },
+            ],
+        },
+        {
+            method: "GET",
+            path: "/hcpcs/codes/stats",
+            summary: "Row count stats for HCPCS/RBCS code reference dataset (18.9K rows)",
+            category: "hcpcs",
         },
     ],
 };
