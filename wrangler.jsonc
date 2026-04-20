@@ -1,45 +1,66 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "cms-pricing-mcp-server",
-  "main": "src/index.ts",
-  "compatibility_date": "2025-03-10",
-  "compatibility_flags": ["nodejs_compat"],
-  "alias": {
-    "ai": "./src/ai-stub.ts"
-  },
-  "migrations": [
-    {
-      "new_sqlite_classes": ["CmsPricingDataDO"],
-      "tag": "v1"
-    },
-    {
-      "new_sqlite_classes": ["MyMCP"],
-      "tag": "v2"
-    }
-  ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "class_name": "CmsPricingDataDO",
-        "name": "CMS_PRICING_DATA_DO"
-      },
-      {
-        "class_name": "MyMCP",
-        "name": "MCP_OBJECT"
-      }
-    ]
-  },
-  "worker_loaders": [
-    { "binding": "CODE_MODE_LOADER" }
-  ],
-  "observability": {
-    "enabled": true
-  },
-  // Monthly check for fee schedule updates (1st of each month at 06:00 UTC)
-  "triggers": {
-    "crons": ["0 6 1 * *"]
-  },
-  "dev": {
-    "port": 8866
-  }
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "cms-pricing-mcp-server",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-03-10",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"alias": {
+		"ai": "./src/ai-stub.ts"
+	},
+	"migrations": [
+		{
+			"new_sqlite_classes": [
+				"CmsPricingDataDO"
+			],
+			"tag": "v1"
+		},
+		{
+			"new_sqlite_classes": [
+				"MyMCP"
+			],
+			"tag": "v2"
+		},
+		{
+			"tag": "v3-purge-mymcp",
+			"deleted_classes": [
+				"MyMCP"
+			]
+		},
+		{
+			"tag": "v4-readd-mymcp",
+			"new_sqlite_classes": [
+				"MyMCP"
+			]
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"class_name": "CmsPricingDataDO",
+				"name": "CMS_PRICING_DATA_DO"
+			},
+			{
+				"class_name": "MyMCP",
+				"name": "MCP_OBJECT"
+			}
+		]
+	},
+	"worker_loaders": [
+		{
+			"binding": "CODE_MODE_LOADER"
+		}
+	],
+	"observability": {
+		"enabled": true
+	},
+	"triggers": {
+		"crons": [
+			"0 6 1 * *"
+		]
+	},
+	"dev": {
+		"port": 8866
+	}
 }
