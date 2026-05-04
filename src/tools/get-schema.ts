@@ -84,9 +84,7 @@ export function registerGetSchema(server: McpServer, env?: SchemaEnv): void {
                     ...sessionDatasets,
                 ];
                 data.message = `${(data.staged_datasets as unknown[]).length} dataset(s) available. Use data_access_id='${FEE_SCHEDULE_DO_ID}' for fee schedule queries.`;
-            } catch {
-                // Fee schedules DO may not be populated yet
-            }
+            } catch { /* best-effort: Fee schedules DO may not be populated yet */ }
 
             return sessionResult;
         },
