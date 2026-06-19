@@ -48,7 +48,7 @@ export function registerGetSchema(server: McpServer, env?: SchemaEnv): void {
                 return sessionHandler(
                     args as Record<string, unknown>,
                     runtimeEnv as Record<string, unknown>,
-                    (extra as { sessionId?: string })?.sessionId,
+                    (extra as Record<string, unknown>),
                 );
             }
 
@@ -56,7 +56,7 @@ export function registerGetSchema(server: McpServer, env?: SchemaEnv): void {
             const sessionResult = await sessionHandler(
                 args as Record<string, unknown>,
                 runtimeEnv as Record<string, unknown>,
-                (extra as { sessionId?: string })?.sessionId,
+                (extra as Record<string, unknown>),
             );
 
             const doNamespace = runtimeEnv.CMS_PRICING_DATA_DO as DurableObjectNamespace | undefined;

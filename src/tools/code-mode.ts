@@ -23,6 +23,8 @@ export function registerCodeMode(
 
     const executeTool = createExecuteTool({
         prefix: "cms_pricing",
+        // Verifiable provenance: cms_pricing_execute results carry a _meta.citation.
+        source: { id: "cms_pricing", name: "CMS Pricing", url: "https://data.cms.gov", license: "U.S. Public Domain" },
         catalog: cmsPricingCatalog,
         apiFetch,
         doNamespace: env.CMS_PRICING_DATA_DO,
