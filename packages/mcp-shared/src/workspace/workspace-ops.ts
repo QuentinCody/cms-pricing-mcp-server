@@ -11,7 +11,7 @@
  * an in-memory SQLite. `WorkspaceDO` is the thin Durable Object that calls them
  * with `this.ctx.storage.sql`.
  */
-import { applyDefaultLimit, assertReadOnlySql } from "../staging/sql-guard";
+
 import {
 	detectArrays,
 	type InferredSchema,
@@ -19,10 +19,20 @@ import {
 	materializeSchema,
 	type SchemaHints,
 } from "../staging/schema-inference";
+import {
+	applyDefaultLimit,
+	assertReadOnlySql,
+	clampLimit,
+	isReadOnlyDescribe,
+	MAX_RESULT_BYTES,
+} from "../staging/sql-guard";
 
 /** The subset of Cloudflare's `SqlStorage` these ops use. */
 export interface WorkspaceSql {
-	exec(query: string, ...bindings: unknown[]): {
+	exec(
+		query: string,
+		...bindings: unknown[]
+	): {
 		toArray(): Record<string, unknown>[];
 		one(): Record<string, unknown> | undefined;
 	};
@@ -61,7 +71,9 @@ function tryParseJson(value: unknown): unknown {
 /** A manifest `tables_json` column → a clean string[] (empty if missing/corrupt). */
 function parseTableList(value: unknown): string[] {
 	const parsed = tryParseJson(value);
-	return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+	return Array.isArray(parsed)
+		? parsed.filter((x): x is string => typeof x === "string")
+		: [];
 }
 
 /** Same sanitizer handleProcess uses to turn an array key into a table name. */
@@ -71,7 +83,10 @@ function sanitizeArrayKey(key: string): string {
 
 /** A friendly dataset handle must be a safe SQL identifier fragment. */
 function sanitizeDataset(name: string): string {
-	const s = name.replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase().replace(/^_+/, "");
+	const s = name
+		.replace(/[^a-zA-Z0-9_]/g, "_")
+		.toLowerCase()
+		.replace(/^_+/, "");
 	if (!s) throw new Error(`Invalid dataset name: "${name}"`);
 	return s;
 }
@@ -80,13 +95,21 @@ function sanitizeDataset(name: string): string {
  * Prefix every table name (and child-table FK parent ref) with `dataset__`, so
  * two datasets' tables coexist in one SQLite without collision and JOIN cleanly.
  */
-export function prefixSchema(schema: InferredSchema, dataset: string): InferredSchema {
+export function prefixSchema(
+	schema: InferredSchema,
+	dataset: string,
+): InferredSchema {
 	return {
 		tables: schema.tables.map((t) => ({
 			...t,
 			name: `${dataset}__${t.name}`,
 			...(t.childOf
-				? { childOf: { ...t.childOf, parentTable: `${dataset}__${t.childOf.parentTable}` } }
+				? {
+						childOf: {
+							...t.childOf,
+							parentTable: `${dataset}__${t.childOf.parentTable}`,
+						},
+					}
 				: {}),
 		})),
 	};
@@ -136,7 +159,10 @@ function dropDatasetTables(sql: WorkspaceSql, dataset: string): void {
  * Materialize `data` into `dataset__*` tables and record it in the manifest.
  * Re-staging the same dataset replaces its prior tables.
  */
-export function stageDataset(sql: WorkspaceSql, params: StageDatasetParams): DatasetHandle {
+export function stageDataset(
+	sql: WorkspaceSql,
+	params: StageDatasetParams,
+): DatasetHandle {
 	ensureWorkspaceTables(sql);
 	const dataset = sanitizeDataset(params.dataset);
 	dropDatasetTables(sql, dataset);
@@ -158,10 +184,13 @@ export function stageDataset(sql: WorkspaceSql, params: StageDatasetParams): Dat
 		const rowsMap = new Map<string, unknown[]>();
 		for (const arr of arrays) {
 			if (arr.rows.length === 0) continue;
-			const baseName = params.schemaHints?.tableName ?? sanitizeArrayKey(arr.key);
-			const actualBase = inferred.tables.length === 1
-				? inferred.tables[0].name
-				: inferred.tables.find((t) => t.name === baseName)?.name ?? baseName;
+			const baseName =
+				params.schemaHints?.tableName ?? sanitizeArrayKey(arr.key);
+			const actualBase =
+				inferred.tables.length === 1
+					? inferred.tables[0].name
+					: (inferred.tables.find((t) => t.name === baseName)?.name ??
+						baseName);
 			rowsMap.set(`${dataset}__${actualBase}`, arr.rows);
 		}
 
@@ -173,17 +202,23 @@ export function stageDataset(sql: WorkspaceSql, params: StageDatasetParams): Dat
 	} else {
 		// No tabular arrays: park the raw payload as a single JSON row, still reachable.
 		const table = `${dataset}__payload`;
-		sql.exec(`CREATE TABLE IF NOT EXISTS "${table}" (id INTEGER PRIMARY KEY AUTOINCREMENT, root_json TEXT)`);
-		sql.exec(`INSERT INTO "${table}" (root_json) VALUES (?)`, JSON.stringify(params.data ?? null));
+		sql.exec(
+			`CREATE TABLE IF NOT EXISTS "${table}" (id INTEGER PRIMARY KEY AUTOINCREMENT, root_json TEXT)`,
+		);
+		sql.exec(
+			`INSERT INTO "${table}" (root_json) VALUES (?)`,
+			JSON.stringify(params.data ?? null),
+		);
 		tables = [table];
 		rowCount = 1;
 		primaryRowCount = 1;
 	}
 
 	const dataAccessId = newDataAccessId(dataset);
-	const completeness: DatasetHandle["completeness"] = failedRows > 0
-		? { complete: false, failed_rows: failedRows }
-		: { complete: true };
+	const completeness: DatasetHandle["completeness"] =
+		failedRows > 0
+			? { complete: false, failed_rows: failedRows }
+			: { complete: true };
 
 	sql.exec(
 		`INSERT OR REPLACE INTO ${MANIFEST}
@@ -198,7 +233,15 @@ export function stageDataset(sql: WorkspaceSql, params: StageDatasetParams): Dat
 		JSON.stringify(completeness),
 	);
 
-	return { dataset, data_access_id: dataAccessId, tables, schema, row_count: rowCount, primary_row_count: primaryRowCount, completeness };
+	return {
+		dataset,
+		data_access_id: dataAccessId,
+		tables,
+		schema,
+		row_count: rowCount,
+		primary_row_count: primaryRowCount,
+		completeness,
+	};
 }
 
 export interface QueryWorkspaceResult {
@@ -207,6 +250,44 @@ export interface QueryWorkspaceResult {
 	sql: string;
 	/** A full page came back and the caller set no LIMIT → there may be more rows. */
 	truncated: boolean;
+	/** Why the result was cut short, when a cost ceiling cut it (doc 03). */
+	truncation?: { reason: "size_limit"; detail: string };
+}
+
+/**
+ * Drop rows past the byte ceiling (doc 03 §5).
+ *
+ * The ROW ceiling is already enforced by the clamped LIMIT in the SQL, and
+ * WorkspaceSql exposes only toArray() — no cursor, so no incremental pull and
+ * no rowsRead to budget against. Rows are therefore already materialized by the
+ * time this runs; it bounds the RESPONSE, which is what the 100 KB transport
+ * limit cares about.
+ */
+function capResultBytes(rows: Record<string, unknown>[]): {
+	rows: Record<string, unknown>[];
+	truncation?: { reason: "size_limit"; detail: string };
+} {
+	// Measure the SERIALIZED ARRAY, not the sum of the rows: the `[]` and the `,`
+	// separators are ~1 byte/row, which at thousands of narrow rows is kilobytes
+	// — enough to push a "capped" response back over the 100 KB transport limit
+	// this cap exists to stay under.
+	let bytes = 2;
+	for (let i = 0; i < rows.length; i++) {
+		bytes += JSON.stringify(rows[i]).length + (i > 0 ? 1 : 0);
+		if (bytes > MAX_RESULT_BYTES) {
+			return {
+				rows: rows.slice(0, i),
+				truncation: {
+					reason: "size_limit",
+					detail:
+						`Result stopped at ${i} of ${rows.length} row(s): the next row would ` +
+						`exceed the ${MAX_RESULT_BYTES}-byte response ceiling. Select fewer ` +
+						"columns or add a LIMIT.",
+				},
+			};
+		}
+	}
+	return { rows };
 }
 
 /** The cross-dataset JOIN surface: read-only SQL across every staged table. */
@@ -215,18 +296,36 @@ export function queryWorkspace(
 	params: { sql: string; limit?: number },
 ): QueryWorkspaceResult {
 	const sanitized = assertReadOnlySql(params.sql);
-	const limit = params.limit ?? 100;
+	// doc 03 §1 — a caller limit can only ever be LOWERED to the hard ceiling.
+	const limit = clampLimit(params.limit ?? 100);
 	const callerSetLimit = sanitized.toLowerCase().includes("limit");
-	const finalSql = applyDefaultLimit(sanitized, limit);
-	const rows = sql.exec(finalSql).toArray();
+	// T3.4 — the `PRAGMA table_info(<table>)` describe takes no LIMIT (appending
+	// one is a SQLite syntax error), so it skips applyDefaultLimit. Mirrors
+	// `queryDataFromDo` in ../staging/utils.ts; `assertReadOnlySql` lets the
+	// describe through, so without this the allowed statement always throws.
+	const isDescribe = isReadOnlyDescribe(sanitized);
+	const finalSql = isDescribe ? sanitized : applyDefaultLimit(sanitized, limit);
+	const all = sql.exec(finalSql).toArray();
+	const capped = capResultBytes(all);
+	const rows = capped.rows;
 
 	// Heuristic truncation: a full default page, with no caller LIMIT, means the
 	// result was capped — signal it so the agent paginates. (Deliberately no
 	// COUNT(*) wrapper: it errors on duplicate-column / complex SQL and the exact
 	// total isn't needed to decide whether to fetch more.)
-	const truncated = !callerSetLimit && rows.length >= limit;
+	// A describe is exempt: no LIMIT was applied, so its row count is the table's
+	// full column count — a >=100-column table would otherwise report truncated.
+	const truncated =
+		capped.truncation != null ||
+		(!isDescribe && !callerSetLimit && all.length >= limit);
 
-	return { rows, row_count: rows.length, sql: finalSql, truncated };
+	return {
+		rows,
+		row_count: rows.length,
+		sql: finalSql,
+		truncated,
+		...(capped.truncation ? { truncation: capped.truncation } : {}),
+	};
 }
 
 export interface WorkspaceDatasetInfo {
@@ -247,26 +346,37 @@ export interface WorkspaceSchemaResult {
 	datasets: WorkspaceDatasetInfo[];
 }
 
-function tableColumns(sql: WorkspaceSql, table: string): Array<{ name: string; type: string }> {
+function tableColumns(
+	sql: WorkspaceSql,
+	table: string,
+): Array<{ name: string; type: string }> {
 	// pragma_table_info() as a table-valued function (a normal SELECT) rather than
 	// a bare PRAGMA statement — portable across SqlStorage and node:sqlite.
 	return sql
-		.exec(`SELECT name, type FROM pragma_table_info('${table.replace(/'/g, "''")}')`)
+		.exec(
+			`SELECT name, type FROM pragma_table_info('${table.replace(/'/g, "''")}')`,
+		)
 		.toArray()
 		.map((c) => ({ name: String(c.name), type: String(c.type) }));
 }
 
 function tableRowCount(sql: WorkspaceSql, table: string): number {
-	const row = sql.exec(`SELECT COUNT(*) as c FROM "${table.replace(/"/g, '""')}"`).one() as { c?: number } | undefined;
+	const row = sql
+		.exec(`SELECT COUNT(*) as c FROM "${table.replace(/"/g, '""')}"`)
+		.one() as { c?: number } | undefined;
 	return Number(row?.c ?? 0);
 }
 
 /** The cross-server catalog: every dataset, its tables, columns and row counts. */
-export function workspaceSchema(sql: WorkspaceSql, dataset?: string): WorkspaceSchemaResult {
+export function workspaceSchema(
+	sql: WorkspaceSql,
+	dataset?: string,
+): WorkspaceSchemaResult {
 	ensureWorkspaceTables(sql);
-	const manifestRows = (dataset
-		? sql.exec(`SELECT * FROM ${MANIFEST} WHERE dataset = ?`, dataset)
-		: sql.exec(`SELECT * FROM ${MANIFEST} ORDER BY created_at, dataset`)
+	const manifestRows = (
+		dataset
+			? sql.exec(`SELECT * FROM ${MANIFEST} WHERE dataset = ?`, dataset)
+			: sql.exec(`SELECT * FROM ${MANIFEST} ORDER BY created_at, dataset`)
 	).toArray();
 
 	const datasets: WorkspaceDatasetInfo[] = manifestRows.map((r) => ({

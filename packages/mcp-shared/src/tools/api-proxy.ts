@@ -8,22 +8,40 @@
  */
 
 import { z } from "zod";
-import type { ToolContext, ToolEntry } from "../registry/types";
 import type { ApiCatalog, ApiFetchFn } from "../codemode/catalog";
 import type { ResolvedSpec } from "../codemode/openapi-resolver";
-import type { SchemaHints } from "../staging/schema-inference";
-import { shouldStage, stageToDoAndRespond, queryDataFromDo, type StageResult, type StageOptions } from "../staging/utils";
 import { inferUpstreamTotal } from "../completeness";
-import { buildDriftHint, buildKnownEndpointIndex } from "./api-proxy-drift";
+import type { ToolContext, ToolEntry } from "../registry/types";
+import type { SchemaHints } from "../staging/schema-inference";
+import { effectiveStagingThreshold } from "../staging/single-record";
+import { clampLimit } from "../staging/sql-guard";
+import {
+	queryDataFromDo,
+	type StageOptions,
+	shouldStage,
+	stageToDoAndRespond,
+} from "../staging/utils";
+import {
+	buildDriftHint,
+	buildKnownEndpointIndex,
+	preflightUnknownEndpoint,
+} from "./api-proxy-drift";
+import { boundedErrorData, TRANSPORT_LIMIT } from "./passthrough-limits";
+import { buildStagedEnvelope, extractStagedColumns } from "./staging-envelope";
+
+// `extractStagedColumns` is re-exported so the long-standing
+// `import { extractStagedColumns } from "./api-proxy"` sites (and its colocated
+// test) stay stable; the envelope helpers themselves live in ./staging-envelope.
+export { extractStagedColumns };
 
 // ---------------------------------------------------------------------------
 
 /** Path traversal patterns to reject */
 const DANGEROUS_PATTERNS = [
-	/\.\.\//,      // Directory traversal
-	/\/\.\./,      // Reverse traversal
-	/%2e%2e/i,     // URL-encoded traversal
-	/\/\//,        // Double slash
+	/\.\.\//, // Directory traversal
+	/\/\.\./, // Reverse traversal
+	/%2e%2e/i, // URL-encoded traversal
+	/\/\//, // Double slash
 ];
 
 export function validatePath(path: string): void {
@@ -40,14 +58,23 @@ export function validatePath(path: string): void {
 /**
  * Interpolate path parameters: /lookup/id/{id} with {id: "ENSG..."} => /lookup/id/ENSG...
  * Returns the interpolated path and remaining (non-path) params.
+ *
+ * A token may repeat: WikiPathways' asset URLs look like
+ * `/pathways/{pwId}/{pwId}.json`. Read the value from the ORIGINAL `params` and
+ * only consume it from the `queryParams` copy — reading the copy meant the
+ * second `{pwId}` saw a key the first had just deleted and threw
+ * "Missing required path parameter: pwId" for a param that WAS supplied.
  */
 export function interpolatePath(
 	path: string,
 	params: Record<string, unknown>,
 ): { path: string; queryParams: Record<string, unknown> } {
 	const queryParams = { ...params };
-	const interpolated = path.replace(/\{(\w+)\}/g, (_match, key) => {
-		const value = queryParams[key];
+	// `[^{}]+` not `\w+`: a token may contain non-word chars (`{gene-id}`), which
+	// `\w+` left unsubstituted. `Object.hasOwn` not a bare lookup: `{toString}`
+	// would otherwise resolve to Object.prototype.toString instead of "missing".
+	const interpolated = path.replace(/\{([^{}]+)\}/g, (_match, key) => {
+		const value = Object.hasOwn(params, key) ? params[key] : undefined;
 		if (value === undefined || value === null) {
 			throw new Error(`Missing required path parameter: ${key}`);
 		}
@@ -77,62 +104,16 @@ export function buildStageOptions(
 ): StageOptions {
 	const workspace = ctx?.workspace;
 	if (workspace && workspaceNamespace) {
-		return { upstreamTotal, workspace: { namespace: workspaceNamespace, id: workspace, dataset: stagingPrefix } };
+		return {
+			upstreamTotal,
+			workspace: {
+				namespace: workspaceNamespace,
+				id: workspace,
+				dataset: stagingPrefix,
+			},
+		};
 	}
 	return { upstreamTotal };
-}
-
-/** Max size (bytes) for a single property to be preserved in the staging envelope. */
-const ENVELOPE_SCALAR_LIMIT = 1024;
-
-/**
- * Copy small scalar properties from the original API response onto the
- * staging metadata object. This preserves values like `.count`, `.total`,
- * `.schema`, `.paging_info` so LLM code can read them without an extra
- * round-trip (ADR-004 Option C).
- */
-function preserveEnvelopeScalars(
-	original: unknown,
-	staging: Record<string, unknown>,
-): void {
-	if (!original || typeof original !== "object" || Array.isArray(original)) {
-		return;
-	}
-	// After the typeof guard, Object.entries is safe on the narrowed `object` type
-	for (const [key, value] of Object.entries(original)) {
-		if (key in staging) continue; // don't clobber staging metadata fields
-		try {
-			const serialized = JSON.stringify(value);
-			if (serialized !== undefined && serialized.length <= ENVELOPE_SCALAR_LIMIT) {
-				staging[key] = value;
-			}
-		} catch { /* best-effort: Skip non-serializable values */ }
-	}
-}
-
-/**
- * Build a human-readable summary of staged tables for the message field.
- * Example: "2 tables: transcript [10 rows], transcript_Exon [271 rows]"
- */
-function buildStagedTableSummary(staged: StageResult): string {
-	const tables = staged.tablesCreated;
-	const rowCounts = staged._staging?.table_row_counts as
-		| Record<string, number>
-		| undefined;
-	if (!tables || tables.length === 0) {
-		return `${staged.totalRows ?? 0} rows`;
-	}
-	if (tables.length === 1) {
-		const rows = rowCounts?.[tables[0]] ?? staged.totalRows ?? 0;
-		return `table "${tables[0]}" [${rows} rows]`;
-	}
-	const details = tables
-		.map((t) => {
-			const rows = rowCounts?.[t];
-			return rows !== undefined ? `${t} [${rows}]` : t;
-		})
-		.join(", ");
-	return `${tables.length} tables: ${details}`;
 }
 
 export interface ApiProxyToolOptions {
@@ -145,7 +126,7 @@ export interface ApiProxyToolOptions {
 	doNamespace?: unknown;
 	/** Prefix for data access IDs (e.g., "gtex") */
 	stagingPrefix?: string;
-	/** Byte threshold for auto-staging (default 100KB) */
+	/** Byte threshold for auto-staging (default 30KB, via DEFAULT_STAGING_THRESHOLD) */
 	stagingThreshold?: number;
 	/** WorkspaceDO namespace — when set and `ctx.workspace` is present, auto-staging routes there (ADR-006 Phase 0). */
 	workspaceNamespace?: unknown;
@@ -168,7 +149,8 @@ export function createApiProxyTool(options: ApiProxyToolOptions): ToolEntry {
 
 	return {
 		name: "__api_proxy",
-		description: "Route API calls from V8 isolate through server HTTP layer. Internal only.",
+		description:
+			"Route API calls from V8 isolate through server HTTP layer. Internal only.",
 		hidden: true,
 		schema: {
 			method: z.enum(["GET", "POST", "PUT", "DELETE"]),
@@ -179,7 +161,9 @@ export function createApiProxyTool(options: ApiProxyToolOptions): ToolEntry {
 		handler: async (input, ctx) => {
 			const method = String(input.method || "GET");
 			const rawPath = String(input.path || "/");
-			const rawParams: Record<string, unknown> = isRecord(input.params) ? input.params : {};
+			const rawParams: Record<string, unknown> = isRecord(input.params)
+				? input.params
+				: {};
 			const body = input.body;
 			let interpolatedPath = rawPath;
 
@@ -189,6 +173,32 @@ export function createApiProxyTool(options: ApiProxyToolOptions): ToolEntry {
 				// Interpolate path params and extract remaining as query params
 				const { path, queryParams } = interpolatePath(rawPath, rawParams);
 				interpolatedPath = path;
+				validatePath(path); // #2 — re-check post-interpolation: a param can inject .. traversal
+
+				// T1.1 — pre-flight path check. When the path is almost certainly a
+				// hallucination (no known endpoint matches it, but a sibling under the
+				// same first segment exists), fail LOCALLY with the structured drift
+				// hint and ZERO upstream round-trip. Servers with no catalog/spec, real
+				// endpoint paths, and wholly-novel paths fall through untouched.
+				const preflight = preflightUnknownEndpoint(
+					method,
+					path,
+					knownEndpoints,
+				);
+				if (preflight) {
+					return {
+						__api_error: true,
+						status: 404,
+						code: "UNKNOWN_ENDPOINT",
+						attempted: `${method} ${path}`,
+						message: preflight.message,
+						...(preflight.suggestions?.[0]
+							? { closest_match: preflight.suggestions[0] }
+							: {}),
+						drift_hint: preflight,
+						preflight: true,
+					};
+				}
 
 				const result = await apiFetch({
 					method,
@@ -197,16 +207,28 @@ export function createApiProxyTool(options: ApiProxyToolOptions): ToolEntry {
 					body,
 				});
 
-				// Check if response should be auto-staged
-				const responseBytes = JSON.stringify(result.data).length;
+				// A resolved non-2xx is a FAILURE (the catch only fires on THROW) — an
+				// adapter that RETURNS {status:502,data} else surfaces it as data with a
+				// citation, the systemic clingen-class silent failure (doc 09/11).
+				if (typeof result.status === "number" && result.status >= 400) {
+					const dh = buildDriftHint(method, path, result.status, knownEndpoints);
+					return { __api_error: true, incomplete: true, status: result.status, message: `Upstream returned HTTP ${result.status}`, data: boundedErrorData(result.data), ...(dh ? { drift_hint: dh } : {}) };
+				}
+
+				// T10.1 — a SINGLE record gets a raised staging threshold so it stays
+				// inline. undefined data (a 204 no-content) sizes to 0, not a throw (#7).
+				const responseBytes = result.data === undefined ? 0 : JSON.stringify(result.data).length;
 				if (
 					doNamespace &&
 					stagingPrefix &&
-					shouldStage(responseBytes, stagingThreshold)
+					shouldStage(
+						responseBytes,
+						effectiveStagingThreshold(result.data, stagingThreshold),
+					)
 				) {
-					// The proxy is the only layer that sees the raw upstream envelope,
-					// so it's where we detect "upstream reports N matching, but this
-					// page only carried M" — the silent under-count failure mode.
+					// upstreamTotal powers the under-count completeness check; the
+					// envelope also carries staged columns (T3.3) and the silent
+					// over-match warning (T1.3), both built in buildStagedEnvelope.
 					const upstreamTotal = inferUpstreamTotal(result.data);
 					const staged = await stageToDoAndRespond(
 						result.data,
@@ -216,47 +238,32 @@ export function createApiProxyTool(options: ApiProxyToolOptions): ToolEntry {
 						undefined,
 						stagingPrefix,
 						ctx?.sessionId,
-						buildStageOptions(ctx, workspaceNamespace, stagingPrefix, upstreamTotal),
+						buildStageOptions(
+							ctx,
+							workspaceNamespace,
+							stagingPrefix,
+							upstreamTotal,
+						),
 					);
-					const tableDetail = buildStagedTableSummary(staged);
-					const completeness = staged._staging?.completeness;
-					const incompleteNote =
-						completeness && completeness.complete === false
-							? ` INCOMPLETE: ${completeness.truncation?.detail ?? ""} ${completeness.truncation?.remedy ?? ""}`.trimEnd()
-							: "";
-					const response: Record<string, unknown> = {
-						__staged: true,
-						data_access_id: staged.dataAccessId,
-						schema: staged.schema,
-						tables_created: staged.tablesCreated,
-						total_rows: staged.totalRows,
-						_staging: staged._staging,
-						...(staged.stagingWarnings ? { staging_warnings: staged.stagingWarnings } : {}),
-						message: `Response auto-staged (${(responseBytes / 1024).toFixed(1)}KB → ${tableDetail}). Use api.query("${staged.dataAccessId}", sql) in-band, or return this object for the caller to use the query_data tool.${incompleteNote}`,
-					};
-
-					preserveEnvelopeScalars(result.data, response);
-
-					return response;
+					return buildStagedEnvelope({
+						staged,
+						responseBytes,
+						originalData: result.data,
+					});
+				}
+				// #3 — an UNSTAGED inline body over the transport limit is silently dropped; fail loud.
+				if (responseBytes > TRANSPORT_LIMIT) {
+					return { __api_error: true, incomplete: true, status: 413, code: "RESPONSE_TOO_LARGE", message: `Response too large (${responseBytes} > ${TRANSPORT_LIMIT}); narrow the query (fewer fields/rows) or use a paged endpoint.` };
 				}
 
 				return result.data;
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
 				const status = (err as { status?: number }).status || 500;
-				const driftHint = buildDriftHint(
-					method,
-					interpolatedPath,
-					status,
-					knownEndpoints,
-				);
-				return {
-					__api_error: true,
-					status,
-					message,
-					data: (err as { data?: unknown }).data,
-					...(driftHint ? { drift_hint: driftHint } : {}),
-				};
+				const driftHint = buildDriftHint(method, interpolatedPath, status, knownEndpoints);
+				// incomplete: a failed fetch (429/timeout/5xx/…) means the evidence for
+				// this call is INCOMPLETE — flag it so a partial answer is not read as whole.
+				return { __api_error: true, incomplete: true, status, message, data: boundedErrorData((err as { data?: unknown }).data), ...(driftHint ? { drift_hint: driftHint } : {}) };
 			}
 		},
 	};
@@ -283,25 +290,30 @@ export interface StageProxyToolOptions {
  * indexes, and other schema inference parameters. These are forwarded to the
  * DO's /process handler and merged with any server-side hints.
  */
-export function createStageProxyTool(options: StageProxyToolOptions): ToolEntry {
+export function createStageProxyTool(
+	options: StageProxyToolOptions,
+): ToolEntry {
 	const { doNamespace, stagingPrefix, workspaceNamespace } = options;
 
 	return {
 		name: "__stage_proxy",
-		description: "Stage arbitrary data from V8 isolate into DO SQLite. Internal only.",
+		description:
+			"Stage arbitrary data from V8 isolate into DO SQLite. Internal only.",
 		hidden: true,
 		schema: {
 			data: z.unknown(),
 			table_name: z.string().optional(),
-			schema_hints: z.object({
-				tableName: z.string().optional(),
-				columnTypes: z.record(z.string(), z.string()).optional(),
-				indexes: z.array(z.string()).optional(),
-				exclude: z.array(z.string()).optional(),
-				skipChildTables: z.array(z.string()).optional(),
-				maxRecursionDepth: z.number().optional(),
-				compositeIndexes: z.array(z.array(z.string())).optional(),
-			}).optional(),
+			schema_hints: z
+				.object({
+					tableName: z.string().optional(),
+					columnTypes: z.record(z.string(), z.string()).optional(),
+					indexes: z.array(z.string()).optional(),
+					exclude: z.array(z.string()).optional(),
+					skipChildTables: z.array(z.string()).optional(),
+					maxRecursionDepth: z.number().optional(),
+					compositeIndexes: z.array(z.array(z.string())).optional(),
+				})
+				.optional(),
 		},
 		handler: async (input, ctx) => {
 			const data = input.data;
@@ -336,7 +348,9 @@ export function createStageProxyTool(options: StageProxyToolOptions): ToolEntry 
 					total_rows: staged.totalRows,
 					schema: staged.schema,
 					_staging: staged._staging,
-					...(staged.stagingWarnings ? { staging_warnings: staged.stagingWarnings } : {}),
+					...(staged.stagingWarnings
+						? { staging_warnings: staged.stagingWarnings }
+						: {}),
 				};
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
@@ -365,16 +379,34 @@ export interface QueryProxyToolOptions {
  * the per-server DO via queryDataFromDo. (Inlines the /ws/query POST rather than
  * importing queryWorkspaceFromDo to keep this module's import graph flat.)
  */
+/** Page size the in-isolate query proxy requests (bounded by clampLimit). */
+const PROXY_QUERY_LIMIT = 1000;
+
 async function runProxyQuery(
 	doNamespace: unknown,
 	workspaceNamespace: unknown,
 	ctx: ToolContext | undefined,
 	dataAccessId: string,
 	sql: string,
-): Promise<{ rows: unknown[]; row_count: number; sql: string; data_access_id: string; truncated?: boolean; total_matching?: number }> {
+): Promise<{
+	rows: unknown[];
+	row_count: number;
+	sql: string;
+	data_access_id: string;
+	truncated?: boolean;
+	total_matching?: number;
+}> {
 	const workspace = (ctx as ToolContext | undefined)?.workspace;
+	// doc 03 §1 — the in-isolate proxy's page size, clamped to the hard ceiling
+	// like every other caller rather than trusted as a bare constant.
+	const limit = clampLimit(PROXY_QUERY_LIMIT);
 	if (!workspace || !workspaceNamespace) {
-		return queryDataFromDo(doNamespace as DurableObjectNamespace, dataAccessId, sql, 1000);
+		return queryDataFromDo(
+			doNamespace as DurableObjectNamespace,
+			dataAccessId,
+			sql,
+			limit,
+		);
 	}
 	const ns = workspaceNamespace as DurableObjectNamespace;
 	const stub = ns.get(ns.idFromName(`ws:${workspace}`));
@@ -382,7 +414,7 @@ async function runProxyQuery(
 		new Request("http://do.internal/ws/query", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ sql, limit: 1000 }),
+			body: JSON.stringify({ sql, limit }),
 		}),
 	);
 	const r = (await resp.json()) as {
@@ -411,12 +443,15 @@ async function runProxyQuery(
  * DO — per-server via queryDataFromDo, or the shared WorkspaceDO when the call's
  * ToolContext carries an active `workspace` (see runProxyQuery).
  */
-export function createQueryProxyTool(options: QueryProxyToolOptions): ToolEntry {
+export function createQueryProxyTool(
+	options: QueryProxyToolOptions,
+): ToolEntry {
 	const { doNamespace, workspaceNamespace } = options;
 
 	return {
 		name: "__query_proxy",
-		description: "Route SQL queries from V8 isolate to staged data DO. Internal only.",
+		description:
+			"Route SQL queries from V8 isolate to staged data DO. Internal only.",
 		hidden: true,
 		schema: {
 			data_access_id: z.string(),
@@ -434,13 +469,23 @@ export function createQueryProxyTool(options: QueryProxyToolOptions): ToolEntry 
 			}
 
 			try {
-				const result = await runProxyQuery(doNamespace, workspaceNamespace, ctx as ToolContext | undefined, dataAccessId, sql);
+				const result = await runProxyQuery(
+					doNamespace,
+					workspaceNamespace,
+					ctx as ToolContext | undefined,
+					dataAccessId,
+					sql,
+				);
 				const queryResult = result as Record<string, unknown>;
 				return {
 					rows: result.rows,
 					row_count: result.row_count,
-					...(queryResult.truncated !== undefined ? { truncated: queryResult.truncated } : {}),
-					...(queryResult.total_matching !== undefined ? { total_matching: queryResult.total_matching } : {}),
+					...(queryResult.truncated !== undefined
+						? { truncated: queryResult.truncated }
+						: {}),
+					...(queryResult.total_matching !== undefined
+						? { total_matching: queryResult.total_matching }
+						: {}),
 					sql: result.sql,
 					data_access_id: result.data_access_id,
 				};

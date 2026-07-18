@@ -2,23 +2,37 @@
  * Staging utilities — decision logic, DO interaction, data access ID generation.
  */
 
-import { getRequestScope, type MaybeExtra } from "../registry/request-scope";
 import {
+	type Completeness,
 	deriveMaterializationCompleteness,
 	mergeCompleteness,
 	paginationCompleteness,
-	type Completeness,
 } from "../completeness";
+import { getRequestScope, type MaybeExtra } from "../registry/request-scope";
+import { parseJsonResponse } from "./do-response";
 import type { SchemaHints } from "./schema-inference";
-import { buildStagingMetadata, type StagingMetadata, type TableRelationship } from "./staging-metadata";
-import { DO_FETCH_ORIGIN, stageIntoWorkspace, type WorkspaceTarget } from "./workspace-staging";
+import {
+	applyDefaultLimit,
+	assertReadOnlySql,
+	isReadOnlyDescribe,
+} from "./sql-guard";
+import {
+	buildStagingMetadata,
+	type StagingMetadata,
+	type TableRelationship,
+} from "./staging-metadata";
+import {
+	DO_FETCH_ORIGIN,
+	stageIntoWorkspace,
+	type WorkspaceTarget,
+} from "./workspace-staging";
 
 // The standard query_data / get_schema tool handlers were extracted to keep this
 // file under the line cap. Re-exported here so the long-standing
 // `@bio-mcp/shared/staging/utils` import path (used across all servers) is stable.
 export {
-	createQueryDataHandler,
 	createGetSchemaHandler,
+	createQueryDataHandler,
 	type DataHandlerOptions,
 } from "./query-handlers";
 
@@ -52,21 +66,24 @@ interface QueryResponse {
 	error?: string;
 	truncated?: boolean;
 	total_matching?: number;
-	diagnostics?: Array<{ severity: string; message: string; help?: string; kind: string }>;
+	count_capped?: boolean;
+	truncation?: { reason: string; detail: string };
+	/** Machine-readable failure code (WRITE_SQL_BLOCKED / QUERY_COST_LIMIT). */
+	code?: string;
+	diagnostics?: Array<{
+		severity: string;
+		message: string;
+		help?: string;
+		kind: string;
+	}>;
 	validated?: boolean;
 }
 
-// ---------------------------------------------------------------------------
-
-/** Safely parse a Response body as JSON with a fallback. */
-async function parseJsonResponse<T>(resp: Response, fallback: T): Promise<T> {
-	const raw: unknown = await resp.json();
-	if (raw === null || typeof raw !== "object") return fallback;
-	return raw as T;
-}
-
 /** Decide whether a response should be staged based on byte size. */
-export function shouldStage(responseBytes: number, threshold?: number): boolean {
+export function shouldStage(
+	responseBytes: number,
+	threshold?: number,
+): boolean {
 	return responseBytes > (threshold ?? DEFAULT_STAGING_THRESHOLD);
 }
 
@@ -172,7 +189,7 @@ async function registerStagedDataset(
  *   If not provided, falls back to `prefix` (the data access ID prefix).
  * @param scope - Application-scope identifier. When provided, registers the staged dataset
  *   in the `__registry__` DO so `<prefix>_get_schema` can enumerate it after context compaction.
- *   Pass the tool handler's `extra` directly (preferred — picks up `_meta.app.chatId` or the
+ *   Pass the tool handler's `extra` directly (preferred — picks up `_meta["dev.quentincody.bio/chatId"]` or the
  *   `mcp-chat-id` header bridge), or a plain string for the legacy MCP transport session form.
  *   Resolved through {@link getRequestScope}.
  * @param options - Optional staging hints. `upstreamTotal` enables pagination
@@ -224,22 +241,31 @@ export async function stageToDoAndRespond(
 	});
 
 	const processResp = await doInstance.fetch(processReq);
-	const processResult = await parseJsonResponse<ProcessResponse>(processResp, { success: false, error: "Empty response from DO" });
+	const processResult = await parseJsonResponse<ProcessResponse>(processResp, {
+		success: false,
+		error: "Empty response from DO",
+	});
 
 	if (!processResult.success) {
-		throw new Error(`Failed to stage data in Durable Object: ${processResult.error || "unknown error"}`);
+		throw new Error(
+			`Failed to stage data in Durable Object: ${processResult.error || "unknown error"}`,
+		);
 	}
 
 	// Fetch schema
 	const schemaResp = await doInstance.fetch(
 		new Request(`${DO_FETCH_ORIGIN}/schema`),
 	);
-	const schemaResult = await parseJsonResponse<SchemaResponse>(schemaResp, { success: false });
+	const schemaResult = await parseJsonResponse<SchemaResponse>(schemaResp, {
+		success: false,
+	});
 
 	const tables = processResult.tables_created ?? [];
 	const primaryTable = tables[0];
 	const primaryTableRows = processResult.table_row_counts
-		? (primaryTable ? (processResult.table_row_counts[primaryTable] ?? 0) : undefined)
+		? primaryTable
+			? (processResult.table_row_counts[primaryTable] ?? 0)
+			: undefined
 		: undefined;
 
 	// Compute a canonical completeness verdict for the staged set. Two signals,
@@ -247,8 +273,14 @@ export async function stageToDoAndRespond(
 	//   1. pagination — upstream reported more records than we staged
 	//   2. materialization — rows dropped while writing into SQLite
 	const warnings = processResult.staging_warnings ?? {};
-	const failedRows = typeof warnings.rows_skipped === "number" ? warnings.rows_skipped : undefined;
-	const dataLossWarning = typeof warnings.data_loss_warning === "string" ? warnings.data_loss_warning : undefined;
+	const failedRows =
+		typeof warnings.rows_skipped === "number"
+			? warnings.rows_skipped
+			: undefined;
+	const dataLossWarning =
+		typeof warnings.data_loss_warning === "string"
+			? warnings.data_loss_warning
+			: undefined;
 	const completeness: Completeness | undefined = mergeCompleteness(
 		paginationCompleteness(options?.upstreamTotal, primaryTableRows),
 		deriveMaterializationCompleteness({
@@ -265,7 +297,15 @@ export async function stageToDoAndRespond(
 	// the *value's meaning* has shifted from MCP transport session to app scope.
 	const resolvedScope = getRequestScope(scope);
 	if (resolvedScope) {
-		await registerStagedDataset(doNamespace, resolvedScope, dataAccessId, tables, processResult.total_rows, resolvedToolPrefix, provenance?.toolName);
+		await registerStagedDataset(
+			doNamespace,
+			resolvedScope,
+			dataAccessId,
+			tables,
+			processResult.total_rows,
+			resolvedToolPrefix,
+			provenance?.toolName,
+		);
 	}
 
 	return {
@@ -303,45 +343,26 @@ export async function queryDataFromDo(
 	row_count: number;
 	truncated?: boolean;
 	total_matching?: number;
+	/** `total_matching` is a floor, not exact — the count scan hit its cap. */
+	count_capped?: boolean;
+	truncation?: { reason: string; detail: string };
 	sql: string;
 	data_access_id: string;
 	executed_at: string;
 }> {
-	// SQL safety validation
-	const sanitizedSql = sql.replace(/--.*$/gm, "").trim();
-
-	if (/\/\*/.test(sanitizedSql)) {
-		throw new Error("C-style /* */ comments are not allowed");
-	}
-	if (sanitizedSql.split(";").filter(Boolean).length > 1) {
-		throw new Error("Only single SQL statements are allowed");
-	}
-
-	const dangerousKeywords = [
-		"DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "CREATE",
-		"TRUNCATE", "REPLACE", "EXEC", "EXECUTE", "PRAGMA",
-		"ATTACH", "DETACH", "REINDEX", "VACUUM", "ANALYZE",
-	];
-	const upperSql = sanitizedSql.toUpperCase();
-	for (const keyword of dangerousKeywords) {
-		// Use word-boundary regex to avoid false positives on column names
-		// like "created_at" matching CREATE, "updated_at" matching UPDATE, etc.
-		const regex = new RegExp(`\\b${keyword}\\b`);
-		if (regex.test(upperSql)) {
-			throw new Error(
-				`SQL command '${keyword}' is not allowed. Only SELECT queries are permitted.`,
-			);
-		}
-	}
-
-	if (!/^\s*(SELECT|WITH)\b/i.test(sanitizedSql)) {
-		throw new Error("Only SELECT/WITH queries are allowed");
-	}
-
-	let finalSql = sanitizedSql;
-	if (!sanitizedSql.toLowerCase().includes("limit")) {
-		finalSql += ` LIMIT ${limit}`;
-	}
+	// SQL safety validation — the single canonical guard from ./sql-guard
+	// (hardening doc 02 §4). The inline copy this replaced had already drifted:
+	// it lacked the compound-SELECT pre-flight and did not strip a trailing `;`,
+	// so `SELECT 1;` became the two-statement `SELECT 1; LIMIT 100`.
+	//
+	// Runs BEFORE the namespace calls below: `get()` creates a new empty DO on
+	// first access, so a rejected statement must not mint a billable DO.
+	const sanitizedSql = assertReadOnlySql(sql);
+	// T3.4 — the `PRAGMA table_info(<table>)` describe takes no LIMIT (appending
+	// one is a SQLite syntax error), so it skips applyDefaultLimit.
+	const finalSql = isReadOnlyDescribe(sanitizedSql)
+		? sanitizedSql
+		: applyDefaultLimit(sanitizedSql, limit);
 
 	const doId = doNamespace.idFromName(dataAccessId);
 	const doInstance = doNamespace.get(doId);
@@ -354,7 +375,9 @@ export async function queryDataFromDo(
 	//   { success: true, schema: { table_count: N, tables: { "tbl1": {...}, ... } } }
 	// NOT an array. Check tables map keys (ignoring internal names).
 	try {
-		const probe = await doInstance.fetch(new Request(`${DO_FETCH_ORIGIN}/schema`));
+		const probe = await doInstance.fetch(
+			new Request(`${DO_FETCH_ORIGIN}/schema`),
+		);
 		if (probe.ok) {
 			const probeJson = (await probe.json()) as {
 				schema?: { tables?: Record<string, unknown>; table_count?: number };
@@ -389,12 +412,19 @@ export async function queryDataFromDo(
 		}),
 	);
 
-	const result = await parseJsonResponse<QueryResponse>(response, { success: false, error: "Empty response from DO" });
+	const result = await parseJsonResponse<QueryResponse>(response, {
+		success: false,
+		error: "Empty response from DO",
+	});
 
 	if (!result.success) {
 		const err = new Error(`Query failed: ${result.error || "Unknown error"}`);
+		if (result.code) {
+			(err as Error & { code: string }).code = result.code;
+		}
 		if (result.diagnostics) {
-			(err as Error & { diagnostics: typeof result.diagnostics }).diagnostics = result.diagnostics;
+			(err as Error & { diagnostics: typeof result.diagnostics }).diagnostics =
+				result.diagnostics;
 		}
 		if (result.validated) {
 			(err as Error & { validated: boolean }).validated = true;
@@ -404,9 +434,17 @@ export async function queryDataFromDo(
 
 	return {
 		rows: result.results ?? [],
-		row_count: result.row_count ?? (result.results?.length ?? 0),
+		row_count: result.row_count ?? result.results?.length ?? 0,
 		...(result.truncated !== undefined ? { truncated: result.truncated } : {}),
-		...(result.total_matching !== undefined ? { total_matching: result.total_matching } : {}),
+		...(result.total_matching !== undefined
+			? { total_matching: result.total_matching }
+			: {}),
+		...(result.count_capped !== undefined
+			? { count_capped: result.count_capped }
+			: {}),
+		...(result.truncation !== undefined
+			? { truncation: result.truncation }
+			: {}),
 		sql: finalSql,
 		data_access_id: dataAccessId,
 		executed_at: new Date().toISOString(),
@@ -430,7 +468,10 @@ export async function getSchemaFromDo(
 	const response = await doInstance.fetch(
 		new Request(`${DO_FETCH_ORIGIN}/schema`),
 	);
-	const result = await parseJsonResponse<SchemaResponse>(response, { success: false, error: "Empty response from DO" });
+	const result = await parseJsonResponse<SchemaResponse>(response, {
+		success: false,
+		error: "Empty response from DO",
+	});
 
 	if (!result.success) {
 		throw new Error(`Schema retrieval failed: ${result.error}`);

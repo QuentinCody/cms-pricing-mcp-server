@@ -252,9 +252,9 @@ function classifyColumn(values: unknown[]): ArrayClassification {
 	if (arrayValues.length < nonNull.length * 0.75) return "plain";
 
 	// Sample from the first non-empty array
-	const sampleArr = arrayValues.find(
-		(a) => (a as unknown[]).length > 0,
-	) as unknown[] | undefined;
+	const sampleArr = arrayValues.find((a) => (a as unknown[]).length > 0) as
+		| unknown[]
+		| undefined;
 	if (!sampleArr || sampleArr.length === 0) return "scalar_array"; // all empty arrays
 
 	if (isObjectArray(sampleArr)) return "object_array";
@@ -266,7 +266,9 @@ function classifyColumn(values: unknown[]): ArrayClassification {
  * Infer the SQLite column type from sampled values.
  * Fix: large strings are TEXT, not JSON. Only actual objects get JSON type.
  */
-function inferColumnType(values: unknown[]): "TEXT" | "INTEGER" | "REAL" | "JSON" {
+function inferColumnType(
+	values: unknown[],
+): "TEXT" | "INTEGER" | "REAL" | "JSON" {
 	let hasInteger = false;
 	let hasReal = false;
 	let hasObject = false;
@@ -352,12 +354,18 @@ function inferChildTableSchema(
 	}
 
 	if (allItems.length === 0) {
-		return [{
-			name: childTableName,
-			columns: [{ name: "parent_id", type: "INTEGER" }],
-			indexes: ["parent_id"],
-			childOf: { parentTable: parentTableName, fkColumn: "parent_id", sourceColumn },
-		}];
+		return [
+			{
+				name: childTableName,
+				columns: [{ name: "parent_id", type: "INTEGER" }],
+				indexes: ["parent_id"],
+				childOf: {
+					parentTable: parentTableName,
+					fkColumn: "parent_id",
+					sourceColumn,
+				},
+			},
+		];
 	}
 
 	// Flatten child items to depth 1 (no deep nesting in child tables)
@@ -369,7 +377,10 @@ function inferChildTableSchema(
 	for (const flat of flatItems) {
 		for (const [col, val] of Object.entries(flat)) {
 			let arr = columnValues.get(col);
-			if (!arr) { arr = []; columnValues.set(col, arr); }
+			if (!arr) {
+				arr = [];
+				columnValues.set(col, arr);
+			}
 			arr.push(val);
 		}
 	}
@@ -381,7 +392,8 @@ function inferChildTableSchema(
 
 	for (const [rawColName, colValues] of columnValues) {
 		// Rename source columns that collide with the synthetic parent_id FK
-		const colName = rawColName === "parent_id" ? "source_parent_id" : rawColName;
+		const colName =
+			rawColName === "parent_id" ? "source_parent_id" : rawColName;
 
 		const classification = classifyColumn(colValues);
 
@@ -433,7 +445,11 @@ function inferChildTableSchema(
 		name: childTableName,
 		columns,
 		indexes,
-		childOf: { parentTable: parentTableName, fkColumn: "parent_id", sourceColumn },
+		childOf: {
+			parentTable: parentTableName,
+			fkColumn: "parent_id",
+			sourceColumn,
+		},
 	};
 
 	return [childTable, ...grandchildTables];
@@ -475,7 +491,12 @@ export function inferSchema(
 			hints?.maxRecursionDepth ?? DEFAULT_MAX_RECURSION_DEPTH,
 			classificationCache,
 		);
-		const { columns, indexes } = buildParentColumns(columnValues, childSourceColumns, classificationCache, hints);
+		const { columns, indexes } = buildParentColumns(
+			columnValues,
+			childSourceColumns,
+			classificationCache,
+			hints,
+		);
 		const compositeIndexes = selectCompositeIndexes(columns, hints);
 
 		tables.push({
@@ -494,7 +515,11 @@ export function inferSchema(
 // Two-pass column-value collection: pass 1 flattens up to MAX_SCAN_ROWS for type
 // inference; pass 2 scans up to MAX_DISCOVERY_ROWS for sparse columns, collecting
 // values only for newly discovered columns so pass-1 thresholds stay intact.
-function collectColumnValues(rows: unknown[], exclude: Set<string>, flatten?: SchemaHints["flatten"]): Map<string, unknown[]> {
+function collectColumnValues(
+	rows: unknown[],
+	exclude: Set<string>,
+	flatten?: SchemaHints["flatten"],
+): Map<string, unknown[]> {
 	const flattenedSample = rows.slice(0, MAX_SCAN_ROWS).map((row) => {
 		if (typeof row !== "object" || row === null) return { value: row };
 		return flattenObject(row as Record<string, unknown>, 2, flatten);
@@ -505,7 +530,10 @@ function collectColumnValues(rows: unknown[], exclude: Set<string>, flatten?: Sc
 		for (const [col, val] of Object.entries(row)) {
 			if (exclude.has(col)) continue;
 			let arr = columnValues.get(col);
-			if (!arr) { arr = []; columnValues.set(col, arr); }
+			if (!arr) {
+				arr = [];
+				columnValues.set(col, arr);
+			}
 			arr.push(val);
 		}
 	}
@@ -548,7 +576,13 @@ function extractChildTables(
 		const classification = classifyColumn(values);
 		cache.set(colName, classification);
 		if (classification === "object_array") {
-			const childTableResults = inferChildTableSchema(tableName, colName, values, 0, maxRecursionDepth);
+			const childTableResults = inferChildTableSchema(
+				tableName,
+				colName,
+				values,
+				0,
+				maxRecursionDepth,
+			);
 			if (childTableResults[0].columns.length <= MAX_CHILD_TABLE_COLUMNS) {
 				childTables.push(...childTableResults);
 				childSourceColumns.add(colName);
@@ -603,14 +637,22 @@ function buildParentColumns(
 }
 
 /** Composite indexes from hints, kept only when every column exists in the table. */
-function selectCompositeIndexes(columns: InferredColumn[], hints?: SchemaHints): string[][] {
+function selectCompositeIndexes(
+	columns: InferredColumn[],
+	hints?: SchemaHints,
+): string[][] {
 	if (!hints?.compositeIndexes) return [];
 	const colNameSet = new Set(columns.map((c) => c.name));
-	return hints.compositeIndexes.filter((composite) => composite.every((col) => colNameSet.has(col)));
+	return hints.compositeIndexes.filter((composite) =>
+		composite.every((col) => colNameSet.has(col)),
+	);
 }
 
 /** Cap wide tables: indexed/early columns stay, the rest demote into one _overflow JSON column. */
-function capTableColumns(columns: InferredColumn[], indexes: string[]): InferredColumn[] {
+function capTableColumns(
+	columns: InferredColumn[],
+	indexes: string[],
+): InferredColumn[] {
 	if (columns.length <= MAX_TABLE_COLUMNS) return columns;
 	const indexedSet = new Set(indexes);
 	const kept: InferredColumn[] = [];
@@ -659,38 +701,14 @@ export interface MaterializationResult {
 
 // Column profiling lives in ./column-profiles (extracted to keep this file
 // under the size cap); re-exported so existing import sites keep working.
-export { computeColumnProfiles, type ColumnProfile, type TableProfile } from "./column-profiles";
+export {
+	type ColumnProfile,
+	computeColumnProfiles,
+	type TableProfile,
+} from "./column-profiles";
 
-/**
- * Convert a value for SQL insertion.
- * - Arrays of scalars → pipe-delimited string
- * - Objects/remaining arrays → JSON.stringify
- * - null/undefined → null
- * - Scalars → as-is
- */
-function sqlValue(v: unknown): unknown {
-	if (v === null || v === undefined) return null;
-	if (Array.isArray(v)) {
-		if (v.length === 0) return null;
-		// Arrays containing objects → JSON.stringify to preserve structure
-		// (prevents data loss from String({}) → "[object Object]")
-		if (v.some((item) => item !== null && typeof item === "object")) {
-			return JSON.stringify(v);
-		}
-		// Scalar array → pipe-delimited
-		return v.map((item) => String(item)).join(" | ");
-	}
-	if (typeof v === "object") return JSON.stringify(v);
-	return v;
-}
-
-// ---------------------------------------------------------------------------
-// SQL identifier quoting — escape embedded double-quotes per SQL standard
-// ---------------------------------------------------------------------------
-
-function quoteIdent(name: string): string {
-	return `"${name.replace(/"/g, '""')}"`;
-}
+// SQL value/identifier emission lives in ./sql-emit (mid-file import; ESM hoists it).
+import { dedupeColumnsByNameCI, quoteIdent, sqlValue } from "./sql-emit";
 
 // ---------------------------------------------------------------------------
 // Table creation helper (shared by parent and child table materialization)
@@ -701,7 +719,9 @@ function createTableAndIndexes(
 	sql: { exec: (query: string, ...bindings: unknown[]) => unknown },
 ): void {
 	const hasIdColumn = table.columns.some((c) => c.name === "id");
-	const colDefs = table.columns
+	// Dedupe case-insensitively: SQLite treats `id` and `ID` as ONE column, so
+	// emitting both threw "duplicate column name" and lost the whole table (rs).
+	const colDefs = dedupeColumnsByNameCI(table.columns)
 		.map((c) => `${quoteIdent(c.name)} ${c.type}`)
 		.join(", ");
 	const tbl = quoteIdent(table.name);
@@ -761,7 +781,10 @@ export function materializeSchema(
 		const parentName = ct.childOf?.parentTable;
 		if (!parentName) continue;
 		let children = childTablesByParent.get(parentName);
-		if (!children) { children = []; childTablesByParent.set(parentName, children); }
+		if (!children) {
+			children = [];
+			childTablesByParent.set(parentName, children);
+		}
 		children.push(ct);
 	}
 
@@ -784,13 +807,16 @@ export function materializeSchema(
 		// Child tables of this table
 		const myChildTables = childTablesByParent.get(table.name) ?? [];
 
-		const colNames = table.columns.map((c) => c.name);
+		const colNames = dedupeColumnsByNameCI(table.columns).map((c) => c.name);
 		const placeholders = colNames.map(() => "?").join(", ");
 		const insertSql = `INSERT INTO ${quoteIdent(table.name)} (${colNames.map((n) => quoteIdent(n)).join(", ")}) VALUES (${placeholders})`;
 
 		// Track IDs for FK resolution and capture child array data
 		const idMap = new Map<number, number>();
-		const capturedChildData = new Map<string, Array<{ parentIndex: number; items: unknown[] }>>();
+		const capturedChildData = new Map<
+			string,
+			Array<{ parentIndex: number; items: unknown[] }>
+		>();
 		for (const ct of myChildTables) {
 			capturedChildData.set(ct.name, []);
 		}
@@ -800,7 +826,11 @@ export function materializeSchema(
 			const row = tableRows[i];
 			const flat =
 				typeof row === "object" && row !== null
-					? flattenObject(row as Record<string, unknown>, flattenDepth, hints?.flatten)
+					? flattenObject(
+							row as Record<string, unknown>,
+							flattenDepth,
+							hints?.flatten,
+						)
 					: { value: row };
 
 			// Capture child array data before inserting
@@ -817,10 +847,14 @@ export function materializeSchema(
 				if (col === "_overflow") {
 					const colSet = new Set(colNames);
 					const overflow: Record<string, unknown> = {};
-					for (const [k, v] of Object.entries(flat as Record<string, unknown>)) {
+					for (const [k, v] of Object.entries(
+						flat as Record<string, unknown>,
+					)) {
 						if (!colSet.has(k)) overflow[k] = v;
 					}
-					return Object.keys(overflow).length > 0 ? JSON.stringify(overflow) : null;
+					return Object.keys(overflow).length > 0
+						? JSON.stringify(overflow)
+						: null;
 				}
 				const v = (flat as Record<string, unknown>)[col];
 				return sqlValue(v);
@@ -847,7 +881,11 @@ export function materializeSchema(
 
 		// Recurse into child tables
 		for (const childTable of myChildTables) {
-			materializeChildTable(childTable, capturedChildData.get(childTable.name) ?? [], idMap);
+			materializeChildTable(
+				childTable,
+				capturedChildData.get(childTable.name) ?? [],
+				idMap,
+			);
 		}
 	}
 
@@ -870,7 +908,10 @@ export function materializeSchema(
 
 		// Track child IDs for grandchild FK resolution
 		const childIdMap = new Map<number, number>();
-		const capturedGrandchildData = new Map<string, Array<{ parentIndex: number; items: unknown[] }>>();
+		const capturedGrandchildData = new Map<
+			string,
+			Array<{ parentIndex: number; items: unknown[] }>
+		>();
 		for (const gct of myGrandchildTables) {
 			capturedGrandchildData.set(gct.name, []);
 		}
@@ -894,7 +935,9 @@ export function materializeSchema(
 					if (!sourceCol) continue;
 					const arr = (childFlat as Record<string, unknown>)[sourceCol];
 					if (Array.isArray(arr) && arr.length > 0) {
-						capturedGrandchildData.get(gct.name)?.push({ parentIndex: childRowIndex, items: arr });
+						capturedGrandchildData
+							.get(gct.name)
+							?.push({ parentIndex: childRowIndex, items: arr });
 					}
 				}
 
@@ -910,7 +953,8 @@ export function materializeSchema(
 					sql.exec(childInsertSql, ...childValues);
 					childIdMap.set(childRowIndex, nextChildId++);
 					totalRows++;
-					tableRowCounts[childTable.name] = (tableRowCounts[childTable.name] ?? 0) + 1;
+					tableRowCounts[childTable.name] =
+						(tableRowCounts[childTable.name] ?? 0) + 1;
 				} catch (err) {
 					failedRows++;
 					if (warnings.length < MAX_SAMPLE_ERRORS) {
@@ -945,5 +989,12 @@ export function materializeSchema(
 		materializeTable(table, tableRows, 2);
 	}
 
-	return { tablesCreated, totalRows, inputRows, failedRows, warnings, tableRowCounts };
+	return {
+		tablesCreated,
+		totalRows,
+		inputRows,
+		failedRows,
+		warnings,
+		tableRowCounts,
+	};
 }
