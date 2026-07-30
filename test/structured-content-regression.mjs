@@ -38,7 +38,7 @@ console.log(`${BLUE}CMS Pricing Structured Content Regression Tests${RESET}`);
 
 const indexContent = readFile('src/index.ts');
 assertContains('src/index.ts', indexContent, 'CmsPricingDataDO', 'index.ts exports CmsPricingDataDO');
-assertContains('src/index.ts', indexContent, 'McpAgent', 'index.ts uses McpAgent');
+assertContains('src/index.ts', indexContent, 'StatelessMcpWorker', 'index.ts uses StatelessMcpWorker');
 assertContains('src/index.ts', indexContent, 'registerCodeMode', 'index.ts registers Code Mode');
 assertContains('src/index.ts', indexContent, 'registerQueryData', 'index.ts registers query-data');
 assertContains('src/index.ts', indexContent, 'registerGetSchema', 'index.ts registers get-schema');

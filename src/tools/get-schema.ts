@@ -1,4 +1,4 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@bio-mcp/shared/mcp";
 import { z } from "zod";
 import { createGetSchemaHandler, getSchemaFromDo } from "@bio-mcp/shared/staging/utils";
 import { FEE_SCHEDULE_DO_ID } from "../lib/fee-schedule-sources";
