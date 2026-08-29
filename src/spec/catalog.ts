@@ -37,7 +37,7 @@ export const cmsPricingCatalog: ApiCatalog = {
     baseUrl: "https://data.cms.gov",
     version: "2024",
     auth: "none",
-    endpointCount: 33,
+    endpointCount: 29,
     notes:
         "- All data from Data.CMS.gov Data API — free, no auth required\n" +
         "- API pattern: GET /data-api/v1/dataset/{uuid}/data with query params\n" +
