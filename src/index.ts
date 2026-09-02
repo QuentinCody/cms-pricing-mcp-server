@@ -6,12 +6,14 @@ import { registerGetSchema } from "./tools/get-schema";
 import { registerCodeMode } from "./tools/code-mode";
 import { CmsPricingDataDO } from "./do";
 import { ingestFeeSchedules } from "./lib/ingest-fee-schedules";
+import { getIdempotencyKey, isAuthorizedIngestRequest } from "./lib/ingest-auth";
 
 export { CmsPricingDataDO };
 
 interface CmsPricingEnv {
     CMS_PRICING_DATA_DO: DurableObjectNamespace;
     CODE_MODE_LOADER: WorkerLoader;
+	CMS_INGEST_TOKEN?: string;
 }
 
 export class MyMCP extends StatelessMcpWorker {
@@ -52,16 +54,39 @@ export default {
         // Manual ingest trigger — POST /ingest to refresh fee schedule data
         if (url.pathname === "/ingest" && request.method === "POST") {
             const cmsPricingEnv = env as unknown as CmsPricingEnv;
-            return handleIngest(cmsPricingEnv);
+			if (!cmsPricingEnv.CMS_INGEST_TOKEN) {
+				return Response.json(
+					{ success: false, error: "CMS_INGEST_TOKEN is not configured" },
+					{ status: 503 },
+				);
+			}
+			if (!isAuthorizedIngestRequest(request, cmsPricingEnv.CMS_INGEST_TOKEN)) {
+				return Response.json(
+					{ success: false, error: "Unauthorized" },
+					{ status: 401 },
+				);
+			}
+			const idempotencyKey = getIdempotencyKey(request);
+			if (!idempotencyKey) {
+				return Response.json(
+					{ success: false, error: "A valid Idempotency-Key header is required" },
+					{ status: 400 },
+				);
+			}
+			return handleIngest(cmsPricingEnv, idempotencyKey);
         }
 
         return new Response("Not found", { status: 404 });
     },
 
     // Cron trigger — runs on schedule to refresh fee schedule CSVs
-    async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
+    async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
         const cmsPricingEnv = env as unknown as CmsPricingEnv;
-        const results = await ingestFeeSchedules(cmsPricingEnv.CMS_PRICING_DATA_DO);
+        const outcome = await ingestFeeSchedules(cmsPricingEnv.CMS_PRICING_DATA_DO, {
+			idempotencyKey: `scheduled:${controller.scheduledTime}`,
+			now: controller.scheduledTime,
+		});
+		const results = outcome.results;
 
         const ok = results.filter((r) => r.status === "ok");
         const failed = results.filter((r) => r.status === "error");
@@ -75,11 +100,17 @@ export default {
     },
 };
 
-async function handleIngest(env: CmsPricingEnv): Promise<Response> {
+async function handleIngest(
+	env: CmsPricingEnv,
+	idempotencyKey: string,
+): Promise<Response> {
     try {
-        const results = await ingestFeeSchedules(env.CMS_PRICING_DATA_DO);
-        return new Response(JSON.stringify({ success: true, results }, null, 2), {
-            status: 200,
+        const outcome = await ingestFeeSchedules(env.CMS_PRICING_DATA_DO, {
+			idempotencyKey,
+		});
+		const status = outcome.status === "in_progress" ? 409 : outcome.status === "error" ? 502 : 200;
+        return new Response(JSON.stringify({ success: outcome.status !== "error", ...outcome }, null, 2), {
+            status,
             headers: { "content-type": "application/json" },
         });
     } catch (err) {

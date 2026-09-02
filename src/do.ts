@@ -1,7 +1,104 @@
 import { RestStagingDO } from "@bio-mcp/shared/staging/rest-staging-do";
 import type { SchemaHints } from "@bio-mcp/shared/staging/schema-inference";
+import {
+	beginIngest,
+	type CompletedIngest,
+	failIngest,
+	INGEST_COMPLETED_PREFIX,
+	INGEST_CONTROL_KEY,
+	type IngestControlState,
+	promoteIngest,
+} from "./lib/ingest-control";
+
+interface BeginRequest {
+	idempotencyKeyHash: string;
+	generation: string;
+	now: number;
+}
+
+interface FailRequest {
+	idempotencyKeyHash: string;
+	failedAt: number;
+	error: string;
+}
 
 export class CmsPricingDataDO extends RestStagingDO {
+	async fetch(request: Request): Promise<Response> {
+		const url = new URL(request.url);
+		if (url.pathname === "/ingest/status" && request.method === "GET") {
+			const state =
+				(await this.ctx.storage.get<IngestControlState>(INGEST_CONTROL_KEY)) ??
+				{};
+			return Response.json({ success: true, ...state });
+		}
+		if (url.pathname === "/ingest/begin" && request.method === "POST") {
+			return this.begin(request);
+		}
+		if (url.pathname === "/ingest/promote" && request.method === "POST") {
+			return this.promote(request);
+		}
+		if (url.pathname === "/ingest/fail" && request.method === "POST") {
+			return this.fail(request);
+		}
+		return super.fetch(request);
+	}
+
+	private async begin(request: Request): Promise<Response> {
+		const body = (await request.json()) as BeginRequest;
+		if (!body.idempotencyKeyHash || !body.generation || !Number.isFinite(body.now)) {
+			return Response.json({ success: false, error: "Invalid begin request" }, { status: 400 });
+		}
+
+		const decision = await this.ctx.storage.transaction(async (txn) => {
+			const state =
+				(await txn.get<IngestControlState>(INGEST_CONTROL_KEY)) ?? {};
+			const completed = await txn.get<CompletedIngest>(
+				`${INGEST_COMPLETED_PREFIX}${body.idempotencyKeyHash}`,
+			);
+			const next = beginIngest(state, completed, body);
+			if (next.status === "acquired") {
+				await txn.put(INGEST_CONTROL_KEY, next.state);
+			}
+			return next;
+		});
+		return Response.json({ success: true, ...decision });
+	}
+
+	private async promote(request: Request): Promise<Response> {
+		const completed = (await request.json()) as CompletedIngest;
+		try {
+			const state = await this.ctx.storage.transaction(async (txn) => {
+				const current =
+					(await txn.get<IngestControlState>(INGEST_CONTROL_KEY)) ?? {};
+				const next = promoteIngest(current, completed);
+				await txn.put(INGEST_CONTROL_KEY, next);
+				await txn.put(
+					`${INGEST_COMPLETED_PREFIX}${completed.idempotencyKeyHash}`,
+					completed,
+				);
+				return next;
+			});
+			return Response.json({ success: true, state });
+		} catch (error) {
+			return Response.json(
+				{ success: false, error: error instanceof Error ? error.message : String(error) },
+				{ status: 409 },
+			);
+		}
+	}
+
+	private async fail(request: Request): Promise<Response> {
+		const body = (await request.json()) as FailRequest;
+		const state = await this.ctx.storage.transaction(async (txn) => {
+			const current =
+				(await txn.get<IngestControlState>(INGEST_CONTROL_KEY)) ?? {};
+			const next = failIngest(current, body);
+			await txn.put(INGEST_CONTROL_KEY, next);
+			return next;
+		});
+		return Response.json({ success: true, state });
+	}
+
     protected getSchemaHints(data: unknown): SchemaHints | undefined {
         if (!data || !Array.isArray(data)) return undefined;
 

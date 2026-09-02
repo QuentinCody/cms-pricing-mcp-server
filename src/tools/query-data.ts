@@ -1,6 +1,8 @@
 import type { McpServer } from "@bio-mcp/shared/mcp";
 import { z } from "zod";
 import { createQueryDataHandler } from "@bio-mcp/shared/staging/utils";
+import { FEE_SCHEDULE_DO_ID } from "../lib/fee-schedule-sources";
+import { resolveFeeScheduleDataAccessId } from "../lib/ingest-fee-schedules";
 
 interface QueryEnv {
     CMS_PRICING_DATA_DO?: unknown;
@@ -9,8 +11,8 @@ interface QueryEnv {
 export function registerQueryData(server: McpServer, env?: QueryEnv): void {
     const handler = createQueryDataHandler("CMS_PRICING_DATA_DO", "cms_pricing");
 
-    server.registerTool(
-        "cms_pricing_query_data",
+	const registerWithName = (name: string) => server.registerTool(
+        name,
         {
             title: "Query Staged CMS Pricing Data",
             description:
@@ -23,7 +25,18 @@ export function registerQueryData(server: McpServer, env?: QueryEnv): void {
         },
         async (args, extra) => {
             const runtimeEnv = env || (extra as { env?: QueryEnv })?.env || {};
-            return handler(args as Record<string, unknown>, runtimeEnv as Record<string, unknown>);
+			const resolvedArgs = { ...args } as Record<string, unknown>;
+			if (
+				resolvedArgs.data_access_id === FEE_SCHEDULE_DO_ID &&
+				runtimeEnv.CMS_PRICING_DATA_DO
+			) {
+				resolvedArgs.data_access_id = await resolveFeeScheduleDataAccessId(
+					runtimeEnv.CMS_PRICING_DATA_DO as DurableObjectNamespace,
+				);
+			}
+            return handler(resolvedArgs, runtimeEnv as Record<string, unknown>);
         },
     );
+	registerWithName("mcp_cms_pricing_query_data");
+	registerWithName("cms_pricing_query_data");
 }

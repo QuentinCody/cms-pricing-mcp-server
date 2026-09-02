@@ -2,6 +2,7 @@ import type { McpServer } from "@bio-mcp/shared/mcp";
 import { z } from "zod";
 import { createGetSchemaHandler, getSchemaFromDo } from "@bio-mcp/shared/staging/utils";
 import { FEE_SCHEDULE_DO_ID } from "../lib/fee-schedule-sources";
+import { resolveFeeScheduleDataAccessId } from "../lib/ingest-fee-schedules";
 
 interface SchemaEnv {
     CMS_PRICING_DATA_DO?: DurableObjectNamespace;
@@ -25,8 +26,8 @@ function extractSchemaInfo(feeSchema: { schema: unknown }) {
 export function registerGetSchema(server: McpServer, env?: SchemaEnv): void {
     const sessionHandler = createGetSchemaHandler("CMS_PRICING_DATA_DO", "cms_pricing");
 
-    server.registerTool(
-        "cms_pricing_get_schema",
+	const registerWithName = (name: string) => server.registerTool(
+        name,
         {
             title: "Get Staged Data Schema",
             description:
@@ -42,11 +43,19 @@ export function registerGetSchema(server: McpServer, env?: SchemaEnv): void {
         },
         async (args, extra) => {
             const runtimeEnv = env || (extra as { env?: SchemaEnv })?.env || {};
-            const dataAccessId = args.data_access_id as string | undefined;
+			let dataAccessId = args.data_access_id as string | undefined;
+			if (
+				dataAccessId === FEE_SCHEDULE_DO_ID &&
+				runtimeEnv.CMS_PRICING_DATA_DO
+			) {
+				dataAccessId = await resolveFeeScheduleDataAccessId(
+					runtimeEnv.CMS_PRICING_DATA_DO,
+				);
+			}
 
             if (dataAccessId) {
                 return sessionHandler(
-                    args as Record<string, unknown>,
+					{ ...args, data_access_id: dataAccessId } as Record<string, unknown>,
                     runtimeEnv as Record<string, unknown>,
                     (extra as Record<string, unknown>),
                 );
@@ -63,7 +72,8 @@ export function registerGetSchema(server: McpServer, env?: SchemaEnv): void {
             if (!doNamespace) return sessionResult;
 
             try {
-                const feeSchema = await getSchemaFromDo(doNamespace, FEE_SCHEDULE_DO_ID);
+				const activeId = await resolveFeeScheduleDataAccessId(doNamespace);
+                const feeSchema = await getSchemaFromDo(doNamespace, activeId);
                 const info = extractSchemaInfo(feeSchema);
                 if (!info) return sessionResult;
 
@@ -89,4 +99,6 @@ export function registerGetSchema(server: McpServer, env?: SchemaEnv): void {
             return sessionResult;
         },
     );
+	registerWithName("mcp_cms_pricing_get_schema");
+	registerWithName("cms_pricing_get_schema");
 }
