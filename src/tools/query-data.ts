@@ -1,7 +1,8 @@
 import type { McpServer } from "@bio-mcp/shared/mcp";
+import { cmsPricingResponse } from "../lib/tool-result";
 import { z } from "zod";
 import { createQueryDataHandler } from "@bio-mcp/shared/staging/utils";
-import { FEE_SCHEDULE_DO_ID } from "../lib/fee-schedule-sources";
+import { FEE_SCHEDULE_HANDLES } from "../lib/fee-schedule-sources";
 import { resolveFeeScheduleDataAccessId } from "../lib/ingest-fee-schedules";
 
 interface QueryEnv {
@@ -20,21 +21,22 @@ export function registerQueryData(server: McpServer, env?: QueryEnv): void {
             inputSchema: {
                 data_access_id: z.string().min(1).describe("Data access ID for the staged dataset"),
                 sql: z.string().min(1).describe("SQL query to execute against the staged data"),
-                limit: z.number().int().positive().max(10000).default(100).optional().describe("Maximum number of rows to return (default: 100)"),
+                limit: z.number().int().positive().max(10000).optional().describe("Maximum number of rows to return (default: 100)"),
             },
         },
         async (args, extra) => {
             const runtimeEnv = env || (extra as { env?: QueryEnv })?.env || {};
 			const resolvedArgs = { ...args } as Record<string, unknown>;
 			if (
-				resolvedArgs.data_access_id === FEE_SCHEDULE_DO_ID &&
+				FEE_SCHEDULE_HANDLES.some(handle => handle === args.data_access_id) &&
 				runtimeEnv.CMS_PRICING_DATA_DO
 			) {
 				resolvedArgs.data_access_id = await resolveFeeScheduleDataAccessId(
 					runtimeEnv.CMS_PRICING_DATA_DO as DurableObjectNamespace,
+					args.data_access_id,
 				);
 			}
-            return handler(resolvedArgs, runtimeEnv as Record<string, unknown>);
+            return cmsPricingResponse(() => handler(resolvedArgs, runtimeEnv as Record<string, unknown>), runtimeEnv, name, extra, args);
         },
     );
 	registerWithName("mcp_cms_pricing_query_data");

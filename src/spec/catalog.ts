@@ -1,4 +1,5 @@
 import type { ApiCatalog } from "@bio-mcp/shared/codemode/catalog";
+import { feeArchiveEndpoints } from "./fee-schedule-archive";
 
 /**
  * Dataset UUID lookup — maps friendly path aliases to Data.CMS.gov dataset UUIDs.
@@ -35,11 +36,11 @@ export const DATASET_MAP: Record<string, string> = {
 export const cmsPricingCatalog: ApiCatalog = {
     name: "CMS Medicare Pricing Data",
     baseUrl: "https://data.cms.gov",
-    version: "2024",
+    version: "2026",
     auth: "none",
-    endpointCount: 29,
+    endpointCount: 34,
     notes:
-        "- All data from Data.CMS.gov Data API — free, no auth required\n" +
+        "- Data.CMS.gov utilization data, CMS.gov PFS release discovery and pinned PFS CSVs — free, no auth required\n" +
         "- API pattern: GET /data-api/v1/dataset/{uuid}/data with query params\n" +
         "- Friendly paths are mapped to UUIDs by the adapter (e.g. /inpatient/by-provider-service)\n" +
         "- Filtering: pass filter[ColumnName]=value as query params (brackets required)\n" +
@@ -51,14 +52,34 @@ export const cmsPricingCatalog: ApiCatalog = {
         "- Code systems: MS-DRG (inpatient), APC (outpatient), HCPCS (physician/DMEPOS/lab). Use /hcpcs/codes to look up or classify any HCPCS/CPT code via the RBCS taxonomy.\n" +
         "- All payment amounts are in USD\n" +
         "- BUILT-IN FEE SCHEDULES: Pre-loaded SQLite tables are available via cms_pricing_query_data with data_access_id='__fee_schedules':\n" +
-        "  - pfs_indicators: Physician Fee Schedule (31K rows) — hcpc, modifier, sdesc, rvu_work, rvu_mp, conv_fact, full_nfac_total, full_fac_total\n" +
-        "  - pfs_localities: Geographic Practice Cost Indices (110 rows) — locality, loc_description, mac, mac_description, gpci_work, gpci_pe, gpci_mp\n" +
-        "  - PFS has TWO rows per code (two conversion factors: transitional vs fully-implemented). Filter with conv_fact or use MAX/MIN.\n" +
-        "  - JOIN pfs_indicators with pfs_localities to calculate geographically-adjusted payment: (rvu_work*gpci_work + pe_rvu*gpci_pe + rvu_mp*gpci_mp) * conv_fact\n" +
+        "  - pfs_indicators: Physician Fee Schedule — inspect native hcpc, modifier, RVU, conv_fact and payment fields.\n" +
+        "  - pfs_localities: Geographic Practice Cost Indices — inspect locality, MAC and GPCI fields.\n" +
+        "  - fee_schedule_sources: actual CSV URL, SHA-256, retrieval time, HTTP validators and qualification status for each loaded table. Absent on older generations: provenance is then unknown.\n" +
+        "  - 2026 PFS distinguishes QP and non-QP conversion factors. Do not infer eligibility from factor ordering or choose MAX/MIN. QP files cover only PFS-payable codes where differential payment may apply.\n" +
+        "  - The configured CSVs are not yet qualified by release/effective month or QP variant. Preserve duplicates and native values; establish eligibility, modifier, locality, site of service and release before calculating payment.\n" +
+        "  - New ingestions preserve CSV values as TEXT, including leading zeros and conversion-factor precision; use explicit numeric CAST only after source qualification.\n" +
         "  - Use cms_pricing_get_schema with data_access_id='__fee_schedules' to see all columns and row counts\n" +
         "- /procedure-summary has CODES ONLY (no descriptions) — use pfs_indicators.sdesc or /physician datasets to look up code descriptions first\n" +
-        "- Data updated annually (most datasets refresh Apr-Oct)",
+        "- Utilization datasets often refresh annually; PFS release discovery is quarterly. Download update dates, effective months and ingestion timestamps are distinct. Discovery does not load ZIP files or update the pinned CSV configuration.",
     endpoints: [
+        ...feeArchiveEndpoints,
+        {
+            method: "GET", path: "/fee-schedules/releases", category: "fee-schedules",
+            summary: "Discover published CMS RVU release links; does not select the currently effective release.",
+            queryParams: [{ name: "year", type: "number", required: false, description: "Filter release codes by four-digit year (2000–2099)." }],
+        },
+        {
+            method: "GET", path: "/fee-schedules/release", category: "fee-schedules",
+            summary: "Read a listed release page, effective month from description, separately labeled download update dates and ZIP URLs. Hash covers the page only; ZIP contents require validation.",
+            queryParams: [
+                { name: "release", type: "string", required: true, description: "Exact lowercase release code from discovery, e.g. rvu26d." },
+                { name: "expected_page_sha256", type: "string", required: false, description: "Reject changed page bytes with HTTP 409." },
+            ],
+        },
+        {
+            method: "GET", path: "/fee-schedules/configured", category: "fee-schedules",
+            summary: "Show pinned CSV configuration and unresolved release/QP qualification. Query fee_schedule_sources for actual loaded source evidence.",
+        },
         // --- Inpatient (MS-DRG) ---
         {
             method: "GET",

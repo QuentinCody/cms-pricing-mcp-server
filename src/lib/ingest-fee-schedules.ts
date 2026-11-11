@@ -6,8 +6,10 @@
  * successfully, so a partial refresh can never replace the current dataset.
  */
 
-import { restFetch } from "@bio-mcp/shared/http/rest-fetch";
-import { parseCsv } from "./csv-parser";
+import { readFeeSchedule, stageFeeTable } from "./fee-schedule-evidence";
+import { archiveSelection, type ArchiveSelection } from "./fee-archive-selection";
+import { stageFeeArchive } from "./ingest-fee-archive";
+import { fail } from "./fee-schedule-http";
 import {
 	generationForKeyHash,
 	hashIdempotencyKey,
@@ -15,6 +17,7 @@ import {
 } from "./ingest-control";
 import {
 	FEE_SCHEDULE_DO_ID,
+	FEE_ARCHIVE_DO_ID,
 	FEE_SCHEDULE_SOURCES,
 	type FeeScheduleSource,
 } from "./fee-schedule-sources";
@@ -44,12 +47,14 @@ export interface IngestOutcome {
 	activeGeneration?: string;
 	results: IngestResultSummary[];
 	error?: string;
+	data_access_id?: string;
 }
 
 export interface IngestOptions {
 	idempotencyKey: string;
 	now?: number;
 	sources?: readonly FeeScheduleSource[];
+	archive?: ArchiveSelection;
 }
 
 function getDo(namespace: IngestNamespace, name: string): DoStub {
@@ -70,67 +75,15 @@ async function controlRequest(
 	);
 }
 
-async function fetchSource(source: FeeScheduleSource): Promise<Response> {
-	const url = new URL(source.url);
-	return restFetch(url.origin, `${url.pathname}${url.search}`, undefined, {
-		headers: { Accept: "text/csv" },
-		retryOn: [429, 500, 502, 503, 504],
-		retries: 2,
-		timeout: 15_000,
-		deadlineMs: 50_000,
-		cache: { ttl: 3_600 },
-		userAgent: "cms-pricing-mcp-server/1.0 (bio-mcp)",
-	});
-}
-
 async function ingestOne(
 	candidate: DoStub,
 	source: FeeScheduleSource,
 ): Promise<IngestResultSummary> {
 	try {
-		const response = await fetchSource(source);
-		if (!response.ok) {
-			return {
-				...source,
-				rows: 0,
-				status: "error",
-				error: `HTTP ${response.status}: ${response.statusText}`,
-			};
-		}
-
-		const rows = parseCsv(await response.text());
-		if (rows.length === 0) {
-			return { ...source, rows: 0, status: "error", error: "CSV parsed to 0 rows" };
-		}
-
-		const staged = await candidate.fetch(
-			new Request("http://cms-pricing.internal/process", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({
-					data: rows,
-					schema_hints: {
-						tableName: source.tableName,
-						indexes: inferIndexes(source),
-					},
-				}),
-			}),
-		);
-		const stagedBody = (await staged.json().catch(() => ({}))) as {
-			success?: boolean;
-			error?: string;
-		};
-		if (!staged.ok || stagedBody.success !== true) {
-			return {
-				...source,
-				rows: rows.length,
-				status: "error",
-				error:
-					stagedBody.error ?? `DO /process failed with HTTP ${staged.status}`,
-			};
-		}
-
-		return { ...source, rows: rows.length, status: "ok" };
+		const { rows, evidence } = await readFeeSchedule(source);
+		const columnTypes = Object.fromEntries(Object.keys(rows[0]).map(key => [key, "TEXT"]));
+		await stageFeeTable(candidate, source.tableName, rows, inferIndexes(source), columnTypes);
+		return { ...source, rows: rows.length, status: "ok", evidence };
 	} catch (error) {
 		return {
 			...source,
@@ -141,28 +94,30 @@ async function ingestOne(
 	}
 }
 
+async function stageSources(candidate: DoStub, sources: readonly FeeScheduleSource[], results: IngestResultSummary[]): Promise<void> {
+	if (!sources.length) throw new Error("No fee-schedule sources configured");
+	for (const source of sources) {
+		const result = await ingestOne(candidate, source);
+		results.push(result);
+		if (result.status === "error") throw new Error(`${result.key}: ${result.error}`);
+	}
+	await stageFeeTable(candidate, "fee_schedule_sources", results.map(result => result.evidence));
+}
+
 export async function ingestFeeSchedules(
 	doNamespace: DurableObjectNamespace,
 	options: IngestOptions,
 ): Promise<IngestOutcome> {
+	if (options.archive && options.sources) fail("Select archive ingestion or legacy CSV sources, not both");
+	const selection = options.archive ? archiveSelection(options.archive) : undefined;
+	const requestHash = selection ? await hashIdempotencyKey(JSON.stringify(selection)) : undefined;
+	const coordinatorId = selection ? FEE_ARCHIVE_DO_ID : FEE_SCHEDULE_DO_ID;
 	const namespace = doNamespace as unknown as IngestNamespace;
-	const keyHash = await hashIdempotencyKey(options.idempotencyKey);
-	const generation = generationForKeyHash(keyHash);
-	const now = options.now ?? Date.now();
-	const coordinator = getDo(namespace, FEE_SCHEDULE_DO_ID);
-	const beginResponse = await controlRequest(coordinator, "/ingest/begin", {
-		idempotencyKeyHash: keyHash,
-		generation,
-		now,
-	});
-	if (!beginResponse.ok) {
-		throw new Error(`Ingest coordinator rejected begin: HTTP ${beginResponse.status}`);
-	}
-	const begin = (await beginResponse.json()) as BeginResponse;
-	if (!begin.success) throw new Error("Ingest coordinator returned an invalid begin response");
+	const { begin, generation, coordinator, keyHash } = await beginFeeIngestion(options, namespace, coordinatorId, requestHash);
 	if (begin.status === "replayed" && begin.completed) {
 		return {
 			status: "replayed",
+			data_access_id: coordinatorId,
 			generation: begin.completed.generation,
 			activeGeneration: begin.state?.activeGeneration,
 			results: begin.completed.results,
@@ -171,6 +126,7 @@ export async function ingestFeeSchedules(
 	if (begin.status === "in_progress") {
 		return {
 			status: "in_progress",
+			data_access_id: coordinatorId,
 			activeGeneration: begin.state?.activeGeneration,
 			results: [],
 		};
@@ -184,15 +140,13 @@ export async function ingestFeeSchedules(
 		);
 		if (!cleared.ok) throw new Error(`Candidate reset failed: HTTP ${cleared.status}`);
 
-		for (const source of options.sources ?? FEE_SCHEDULE_SOURCES) {
-			const result = await ingestOne(candidate, source);
-			results.push(result);
-			if (result.status === "error") throw new Error(`${result.key}: ${result.error}`);
-		}
+		if (selection) await stageFeeArchive(candidate, selection, results);
+		else await stageSources(candidate, options.sources ?? FEE_SCHEDULE_SOURCES, results);
 
 		const completedAt = Date.now();
 		const promoted = await controlRequest(coordinator, "/ingest/promote", {
 			idempotencyKeyHash: keyHash,
+			requestHash,
 			generation,
 			completedAt,
 			results,
@@ -202,6 +156,7 @@ export async function ingestFeeSchedules(
 		}
 		return {
 			status: "ok",
+			data_access_id: coordinatorId,
 			generation,
 			activeGeneration: generation,
 			results,
@@ -210,11 +165,13 @@ export async function ingestFeeSchedules(
 		const message = error instanceof Error ? error.message : String(error);
 		await controlRequest(coordinator, "/ingest/fail", {
 			idempotencyKeyHash: keyHash,
+			generation,
 			failedAt: Date.now(),
 			error: message,
 		}).catch(() => undefined);
 		return {
 			status: "error",
+			data_access_id: coordinatorId,
 			activeGeneration: begin.state?.activeGeneration,
 			results,
 			error: message,
@@ -222,23 +179,43 @@ export async function ingestFeeSchedules(
 	}
 }
 
+async function beginFeeIngestion(options: IngestOptions, namespace: IngestNamespace, coordinatorId: string, requestHash: string | undefined) {
+  const keyHash = await hashIdempotencyKey(options.idempotencyKey);
+  const generation = `${generationForKeyHash(keyHash)}_${crypto.randomUUID()}`;
+  const now = options.now ?? Date.now();
+  const coordinator = getDo(namespace, coordinatorId);
+  const beginResponse = await controlRequest(coordinator, "/ingest/begin", {
+    idempotencyKeyHash: keyHash,
+    requestHash,
+    generation,
+    now,
+  });
+  if (!beginResponse.ok) {
+    fail(`Ingest coordinator rejected begin: HTTP ${beginResponse.status}; idempotency keys cannot change source selection`, beginResponse.status);
+  }
+  const begin = (await beginResponse.json()) as BeginResponse;
+  if (!begin.success) throw new Error("Ingest coordinator returned an invalid begin response");
+  return { begin, generation, coordinator, keyHash };
+}
+
 /** Resolve the stable public handle to the currently promoted generation. */
 export async function resolveFeeScheduleDataAccessId(
 	doNamespace: DurableObjectNamespace,
+	handle: string = FEE_SCHEDULE_DO_ID,
 ): Promise<string> {
 	try {
 		const namespace = doNamespace as unknown as IngestNamespace;
-		const coordinator = getDo(namespace, FEE_SCHEDULE_DO_ID);
+		const coordinator = getDo(namespace, handle);
 		const response = await coordinator.fetch(
 			new Request("http://cms-pricing.internal/ingest/status"),
 		);
-		if (!response.ok) return FEE_SCHEDULE_DO_ID;
+		if (!response.ok) return handle;
 		const status = (await response.json()) as { activeGeneration?: unknown };
 		return typeof status.activeGeneration === "string"
 			? status.activeGeneration
-			: FEE_SCHEDULE_DO_ID;
+			: handle;
 	} catch {
-		return FEE_SCHEDULE_DO_ID;
+		return handle;
 	}
 }
 

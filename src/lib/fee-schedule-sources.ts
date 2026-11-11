@@ -15,12 +15,15 @@ export interface FeeScheduleSource {
     tableName: string;
     /** Expected update schedule */
     schedule: "annual" | "quarterly";
-    /** Approximate year/quarter this URL covers */
+    /** Configuration label, not verified effective-date or release evidence */
     period: string;
 }
 
 /** Well-known data_access_id used by the cron to stage fee schedules */
 export const FEE_SCHEDULE_DO_ID = "__fee_schedules";
+/** Independently promoted quarterly archives; the legacy CSV cron does not write here. */
+export const FEE_ARCHIVE_DO_ID = "__fee_schedule_archive";
+export const FEE_SCHEDULE_HANDLES = [FEE_SCHEDULE_DO_ID, FEE_ARCHIVE_DO_ID] as const;
 
 export const FEE_SCHEDULE_SOURCES: FeeScheduleSource[] = [
     {
@@ -28,7 +31,7 @@ export const FEE_SCHEDULE_SOURCES: FeeScheduleSource[] = [
         name: "Physician Fee Schedule — Indicators (RVUs, Payment Rates)",
         url: "https://pfs.data.cms.gov/sites/default/files/data/indicators2026-02-10-2026.csv",
         tableName: "pfs_indicators",
-        schedule: "annual",
+        schedule: "quarterly",
         period: "2026",
     },
     {

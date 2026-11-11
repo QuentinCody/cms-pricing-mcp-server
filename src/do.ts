@@ -12,12 +12,14 @@ import {
 
 interface BeginRequest {
 	idempotencyKeyHash: string;
+	requestHash?: string;
 	generation: string;
 	now: number;
 }
 
 interface FailRequest {
 	idempotencyKeyHash: string;
+	generation: string;
 	failedAt: number;
 	error: string;
 }
@@ -61,7 +63,7 @@ export class CmsPricingDataDO extends RestStagingDO {
 			}
 			return next;
 		});
-		return Response.json({ success: true, ...decision });
+		return Response.json({ success: decision.status !== "conflict", ...decision }, { status: decision.status === "conflict" ? 409 : 200 });
 	}
 
 	private async promote(request: Request): Promise<Response> {
@@ -100,6 +102,10 @@ export class CmsPricingDataDO extends RestStagingDO {
 	}
 
     protected getSchemaHints(data: unknown): SchemaHints | undefined {
+        if (data && typeof data === "object" && "table_kind" in data && data.table_kind === "pfs_rvu_rows" && "records" in data && Array.isArray(data.records)) {
+            const row = data.records[0];
+            return { tableName: "pfs_rvu_rows", indexes: ["HCPCS", "MOD"], columnTypes: Object.fromEntries(Object.keys(row ?? {}).map(key => [key, "TEXT"])) };
+        }
         if (!data || !Array.isArray(data)) return undefined;
 
         const sample = data[0];

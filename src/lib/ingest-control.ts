@@ -1,3 +1,5 @@
+import type { FeeScheduleEvidence } from "./fee-schedule-evidence";
+
 export const INGEST_CONTROL_KEY = "cms-pricing:ingest-control";
 export const INGEST_COMPLETED_PREFIX = "cms-pricing:ingest-completed:";
 export const INGEST_LEASE_MS = 20 * 60 * 1000;
@@ -9,10 +11,12 @@ export interface IngestResultSummary {
 	rows: number;
 	status: "ok" | "error";
 	error?: string;
+	evidence?: FeeScheduleEvidence;
 }
 
 export interface CompletedIngest {
 	idempotencyKeyHash: string;
+	requestHash?: string;
 	generation: string;
 	completedAt: number;
 	results: IngestResultSummary[];
@@ -23,6 +27,7 @@ export interface IngestControlState {
 	previousGeneration?: string;
 	running?: {
 		idempotencyKeyHash: string;
+		requestHash?: string;
 		generation: string;
 		startedAt: number;
 		leaseExpiresAt: number;
@@ -37,6 +42,7 @@ export interface IngestControlState {
 export type BeginDecision =
 	| { status: "acquired"; state: IngestControlState }
 	| { status: "in_progress"; state: IngestControlState }
+	| { status: "conflict"; state: IngestControlState; error: string }
 	| {
 			status: "replayed";
 			state: IngestControlState;
@@ -48,10 +54,13 @@ export function beginIngest(
 	completed: CompletedIngest | undefined,
 	request: {
 		idempotencyKeyHash: string;
+		requestHash?: string;
 		generation: string;
 		now: number;
 	},
 ): BeginDecision {
+	const existing = completed ?? (state.running?.idempotencyKeyHash === request.idempotencyKeyHash ? state.running : undefined);
+	if (existing && existing.requestHash !== request.requestHash) return { status: "conflict", state, error: "Idempotency key is already bound to a different source selection" };
 	if (completed) return { status: "replayed", state, completed };
 	if (state.running && state.running.leaseExpiresAt > request.now) {
 		return { status: "in_progress", state };
@@ -63,6 +72,7 @@ export function beginIngest(
 			...state,
 			running: {
 				idempotencyKeyHash: request.idempotencyKeyHash,
+				requestHash: request.requestHash,
 				generation: request.generation,
 				startedAt: request.now,
 				leaseExpiresAt: request.now + INGEST_LEASE_MS,
@@ -79,7 +89,9 @@ export function promoteIngest(
 	if (
 		!running ||
 		running.idempotencyKeyHash !== completed.idempotencyKeyHash ||
-		running.generation !== completed.generation
+		running.generation !== completed.generation ||
+		running.requestHash !== completed.requestHash ||
+		!Number.isFinite(completed.completedAt) || completed.completedAt > running.leaseExpiresAt
 	) {
 		throw new Error("Ingest promotion does not own the active lease");
 	}
@@ -97,9 +109,9 @@ export function promoteIngest(
 
 export function failIngest(
 	state: IngestControlState,
-	request: { idempotencyKeyHash: string; failedAt: number; error: string },
+	request: { idempotencyKeyHash: string; generation: string; failedAt: number; error: string },
 ): IngestControlState {
-	if (state.running?.idempotencyKeyHash !== request.idempotencyKeyHash) {
+	if (state.running?.idempotencyKeyHash !== request.idempotencyKeyHash || state.running.generation !== request.generation) {
 		return state;
 	}
 	return {

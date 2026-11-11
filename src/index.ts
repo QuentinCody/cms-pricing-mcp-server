@@ -7,6 +7,7 @@ import { registerCodeMode } from "./tools/code-mode";
 import { CmsPricingDataDO } from "./do";
 import { ingestFeeSchedules } from "./lib/ingest-fee-schedules";
 import { getIdempotencyKey, isAuthorizedIngestRequest } from "./lib/ingest-auth";
+import { ingestSelection } from "./lib/fee-archive-selection";
 
 export { CmsPricingDataDO };
 
@@ -73,7 +74,7 @@ export default {
 					{ status: 400 },
 				);
 			}
-			return handleIngest(cmsPricingEnv, idempotencyKey);
+			return handleIngest(request, cmsPricingEnv, idempotencyKey);
         }
 
         return new Response("Not found", { status: 404 });
@@ -101,12 +102,14 @@ export default {
 };
 
 async function handleIngest(
+	request: Request,
 	env: CmsPricingEnv,
 	idempotencyKey: string,
 ): Promise<Response> {
     try {
         const outcome = await ingestFeeSchedules(env.CMS_PRICING_DATA_DO, {
 			idempotencyKey,
+			archive: await ingestSelection(request),
 		});
 		const status = outcome.status === "in_progress" ? 409 : outcome.status === "error" ? 502 : 200;
         return new Response(JSON.stringify({ success: outcome.status !== "error", ...outcome }, null, 2), {
@@ -115,8 +118,9 @@ async function handleIngest(
         });
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        const errorStatus = err && typeof err === "object" && "status" in err ? err.status : undefined;
         return new Response(JSON.stringify({ success: false, error: msg }), {
-            status: 500,
+            status: typeof errorStatus === "number" && errorStatus >= 400 && errorStatus <= 599 ? errorStatus : 500,
             headers: { "content-type": "application/json" },
         });
     }
