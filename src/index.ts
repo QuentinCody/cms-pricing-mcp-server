@@ -1,3 +1,4 @@
+import { FEE_SCHEDULE_HANDLES } from "./lib/fee-schedule-sources";
 import { buildHealthResponse, configureCitationSigning } from "@bio-mcp/shared";
 import { StatelessMcpWorker } from "@bio-mcp/shared/mcp";
 import { McpServer } from "@bio-mcp/shared/mcp";
@@ -10,6 +11,8 @@ import { getIdempotencyKey, isAuthorizedIngestRequest } from "./lib/ingest-auth"
 import { ingestSelection } from "./lib/fee-archive-selection";
 
 export { CmsPricingDataDO };
+
+const publicationReads = new Set(["GET /schema", "GET /ingest/status", "POST /query"]);
 
 interface CmsPricingEnv {
     CMS_PRICING_DATA_DO: DurableObjectNamespace;
@@ -49,7 +52,12 @@ export default {
         }
 
         if (url.pathname === "/mcp") {
-            return MyMCP.serve("/mcp").fetch(request, env, ctx);
+            return MyMCP.serve("/mcp", {
+                publishedDataReads: (binding, name) => binding === "CMS_PRICING_DATA_DO" && (
+                    FEE_SCHEDULE_HANDLES.some(handle => name === handle) ||
+                    /^__fee_schedules_generation_[a-f0-9]{24}(?:_[a-f0-9-]{36})?$/.test(name)
+                ) ? publicationReads : undefined,
+            }).fetch(request, env, ctx);
         }
 
         // Manual ingest trigger — POST /ingest to refresh fee schedule data
